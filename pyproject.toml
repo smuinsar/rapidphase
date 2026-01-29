@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rapidphase"
-version = "0.1.0"
+version = "0.1.1"
 description = "Fast GPU-accelerated phase unwrapping using PyTorch (CUDA/MPS/CPU)"
 readme = "README.md"
 license = {text = "MIT"}
@@ -37,8 +37,8 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/smuinsar/DeepLearning/tree/main/packages/rapidphase"
-Repository = "https://github.com/smuinsar/DeepLearning"
+Homepage = "https://github.com/smuinsar/rapidphase/tree/main/"
+Repository = "https://github.com/smuinsar/rapidphase"
 
 [tool.setuptools.packages.find]
 where = ["src"]
