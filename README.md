@@ -200,7 +200,7 @@ If you use RapidPhase in your research, please cite:
 ```bibtex
 @software{rapidphase,
   title = {RapidPhase: GPU-accelerated phase unwrapping},
-  url = {https://github.com/smuinsar/rapidphase/tree/main/rapidphase},
+  url = {https://github.com/smuinsar/rapidphase/tree/main/},
   year = {2025},
 }
 
