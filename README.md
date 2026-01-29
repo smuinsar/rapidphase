@@ -2,6 +2,7 @@
 
 **GPU-accelerated phase unwrapping for InSAR processing**
 
+[![PyPI](https://img.shields.io/pypi/v/rapidphase.svg)](https://pypi.org/project/rapidphase/)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
@@ -21,15 +22,21 @@ RapidPhase provides fast phase unwrapping algorithms optimized for GPU execution
 ## Installation
 
 ```bash
+pip install rapidphase
+
+# Or install with raster I/O support
+pip install "rapidphase[raster]"
+```
+
+### Development Installation
+
+```bash
 # Clone the repository
 git clone https://github.com/smuinsar/rapidphase.git
 cd rapidphase
 
 # Install in development mode
-pip install -e .
-
-# Or install with raster I/O support
-pip install -e ".[raster]"
+pip install -e ".[dev]"
 ```
 
 ### Requirements
