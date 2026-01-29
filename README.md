@@ -1,0 +1,199 @@
+# RapidPhase
+
+**GPU-accelerated phase unwrapping for InSAR processing**
+
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
+
+RapidPhase provides fast phase unwrapping algorithms optimized for GPU execution (NVIDIA CUDA and Apple Silicon MPS), with automatic CPU fallback. It offers a simple API compatible with [snaphu-py](https://github.com/isce-framework/snaphu-py) while delivering significant speedups on GPU hardware.
+
+## Features
+
+- **GPU Acceleration**: Automatic device selection (CUDA > MPS > CPU)
+- **Multiple Algorithms**:
+  - **DCT**: Fast unweighted least-squares using Discrete Cosine Transform
+  - **IRLS**: Iteratively Reweighted Least Squares with coherence weighting
+  - **IRLS-CG**: Conjugate Gradient solver with L1-norm approximation
+- **Tiled Processing**: Handle large interferograms with automatic tile merging
+- **snaphu-py Compatible**: Drop-in replacement API for easy migration
+
+## Installation
+
+```bash
+# Clone the repository
+git clone https://github.com/smuinsar/rapidphase.git
+cd rapidphase
+
+# Install in development mode
+pip install -e .
+
+# Or install with raster I/O support
+pip install -e ".[raster]"
+```
+
+### Requirements
+
+- Python >= 3.9
+- PyTorch >= 2.0
+- NumPy >= 1.20
+- SciPy >= 1.7
+
+For GPU acceleration:
+- **NVIDIA GPU**: CUDA toolkit and compatible PyTorch
+- **Apple Silicon**: macOS 12.3+ with MPS-enabled PyTorch
+
+## Quick Start
+
+```python
+import numpy as np
+import rapidphase
+
+# Create sample interferogram
+y, x = np.ogrid[-3:3:512j, -3:3:512j]
+igram = np.exp(1j * np.pi * (x + y))
+corr = np.ones(igram.shape, dtype=np.float32)
+
+# Unwrap with automatic GPU detection
+unw, conncomp = rapidphase.unwrap(igram, corr, nlooks=1.0)
+
+# Check available devices
+print(rapidphase.get_available_devices())
+# {'cpu': True, 'cuda': True, 'mps': False, 'cuda_devices': [...]}
+```
+
+## API Reference
+
+### Main Function
+
+```python
+unw, conncomp = rapidphase.unwrap(
+    igram,              # Complex interferogram or wrapped phase
+    corr=None,          # Coherence map (optional), values in [0, 1]
+    nlooks=1.0,         # Number of looks for weight conversion
+    algorithm="auto",   # "dct", "irls", "irls_cg", or "auto"
+    device="auto",      # "cuda", "mps", "cpu", or "auto"
+    ntiles=None,        # Tile grid for large images, e.g., (4, 4)
+    tile_overlap=64,    # Overlap in pixels between tiles
+)
+```
+
+### Convenience Functions
+
+```python
+# Fast DCT (no coherence weighting)
+unw, conncomp = rapidphase.unwrap_dct(igram)
+
+# IRLS with Jacobi solver (coherence-weighted)
+unw, conncomp = rapidphase.unwrap_irls(igram, corr, nlooks=5.0)
+
+# IRLS with Conjugate Gradient (L1 approximation, robust to outliers)
+unw, conncomp = rapidphase.unwrap_irls_cg(igram, corr, nlooks=5.0)
+```
+
+### Tiled Processing for Large Images
+
+```python
+# Process a large interferogram using 4x4 tiles
+unw, conncomp = rapidphase.unwrap(
+    igram_large,
+    corr_large,
+    nlooks=10.0,
+    ntiles=(4, 4),
+    tile_overlap=128,
+)
+```
+
+### When to Use Each Algorithm
+
+- **DCT**: Best for clean data with high coherence. Fastest option.
+- **IRLS**: Good balance of speed and quality. Uses coherence for adaptive weighting.
+- **IRLS-CG**: Better for noisy data with outliers. Approximates L1-norm for robustness.
+- **SNAPHU**: Use when you need to handle phase discontinuities (e.g., fault lines).
+
+## Examples
+
+See the [examples/phase_unwrapping_examples.ipynb](examples/phase_unwrapping_examples.ipynb) notebook for:
+
+1. Basic phase unwrapping
+2. Tiled processing for large images
+3. DCT vs IRLS algorithm comparison
+4. Complex interferogram patterns
+5. Noisy data handling
+6. Comparison with SNAPHU
+7. Real NISAR interferogram processing
+
+## Performance
+
+RapidPhase achieves significant speedups over CPU-based SNAPHU:
+
+| Image Size | RapidPhase (GPU) | SNAPHU (CPU) | Speedup |
+|------------|-----------------|--------------|---------|
+| 256×256 | ~0.02s | ~0.15s | ~7× |
+| 512×512 | ~0.03s | ~0.6s | ~20× |
+| 1024×1024 | ~0.1s | ~2.5s | ~25× |
+
+*Benchmarks on NVIDIA RTX 3090. Actual performance varies by hardware.*
+
+## Project Structure
+
+```
+rapidphase/
+├── src/rapidphase/
+│   ├── __init__.py       # Package exports
+│   ├── api.py            # Public API
+│   ├── core/             # Unwrapping algorithms
+│   │   ├── dct_solver.py
+│   │   ├── irls_solver.py
+│   │   └── irls_cg_solver.py
+│   ├── device/           # GPU/CPU device management
+│   ├── tiling/           # Tile processing for large images
+│   ├── utils/            # Phase operations, quality metrics
+│   └── io/               # Raster I/O (optional)
+├── tests/                # Unit tests
+├── examples/             # Jupyter notebooks
+└── npy/                  # Sample data (NISAR)
+```
+
+## Development
+
+```bash
+# Install dev dependencies
+pip install -e ".[dev]"
+
+# Run tests
+pytest
+
+# Run tests with coverage
+pytest --cov=rapidphase
+```
+
+## License
+
+MIT License - see [LICENSE](LICENSE) for details.
+
+## Citation
+
+If you use RapidPhase in your research, please cite:
+
+```bibtex
+@software{rapidphase,
+  title = {RapidPhase: GPU-accelerated phase unwrapping},
+  url = {https://github.com/smuinsar/rapidphase/tree/main/rapidphase},
+  year = {2025},
+}
+
+@article{DuboisTaine2024,
+  title={Iteratively Reweighted Least Squares for Phase Unwrapping},
+  author={Dubois-Taine, Benjamin and Akiki, Roland and d'Aspremont, Alexandre},
+  journal={arXiv preprint arXiv:2401.09961},
+  year={2024},
+  doi={10.48550/arXiv.2401.09961}
+}
+```
+
+## Acknowledgments
+
+- The IRLS-CG algorithm is based on [Dubois-Taine et al. (2024)](https://doi.org/10.48550/arXiv.2401.09961)
+- Algorithm implementations inspired by [SNAPHU](https://web.stanford.edu/group/radar/softwareandlinks/sw/snaphu/) and related literature
+- Built with [PyTorch](https://pytorch.org/) for GPU acceleration
