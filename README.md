@@ -201,7 +201,7 @@ If you use RapidPhase in your research, please cite:
 @software{rapidphase,
   title = {RapidPhase: GPU-accelerated phase unwrapping},
   url = {https://github.com/smuinsar/rapidphase/tree/main/},
-  year = {2025},
+  year = {2026},
 }
 
 @article{DuboisTaine2024,
