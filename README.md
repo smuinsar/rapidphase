@@ -19,6 +19,20 @@ RapidPhase provides fast phase unwrapping algorithms optimized for GPU execution
 - **Tiled Processing**: Handle large interferograms with automatic tile merging
 - **snaphu-py Compatible**: Drop-in replacement API for easy migration
 
+## Example Results
+
+### NISAR Interferogram Unwrapping
+
+Processing a NISAR interferogram showing wrapped phase, coherence, and the unwrapped result:
+
+![NISAR Unwrapping Example](images/NISAR_unwrap.png)
+
+### OPERA CSLC Algorithm Comparison
+
+Comparison of DCT, IRLS, and IRLS-CG algorithms on OPERA CSLC data:
+
+![OPERA CSLC Unwrapping](images/OPERA_unwrap.png)
+
 ## Installation
 
 ```bash
