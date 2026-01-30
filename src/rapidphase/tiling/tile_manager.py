@@ -13,6 +13,13 @@ from typing import TYPE_CHECKING, Callable
 import numpy as np
 import torch
 
+# Try to import tqdm for progress bars, fall back to simple iteration
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
+
 if TYPE_CHECKING:
     from rapidphase.device.manager import DeviceManager
 
@@ -493,14 +500,25 @@ class TileManager:
         tiles = self.compute_tiles((H, W))
         n_tiles = len(tiles)
 
-        if verbose:
-            print(f"Processing {n_tiles} tiles ({self.ntiles[0]}x{self.ntiles[1]})...")
-
         # Store processed tiles as numpy arrays (CPU memory)
         processed_tiles_np: list[tuple[TileInfo, np.ndarray]] = []
 
-        for i, tile in enumerate(tiles):
-            if verbose and (i % max(1, n_tiles // 10) == 0 or i == n_tiles - 1):
+        # Set up progress iteration
+        if verbose and HAS_TQDM:
+            tile_iter = tqdm(
+                enumerate(tiles),
+                total=n_tiles,
+                desc=f"Unwrapping tiles ({self.ntiles[0]}x{self.ntiles[1]})",
+                unit="tile",
+            )
+        elif verbose:
+            print(f"Processing {n_tiles} tiles ({self.ntiles[0]}x{self.ntiles[1]})...")
+            tile_iter = enumerate(tiles)
+        else:
+            tile_iter = enumerate(tiles)
+
+        for i, tile in tile_iter:
+            if verbose and not HAS_TQDM and (i % max(1, n_tiles // 10) == 0 or i == n_tiles - 1):
                 print(f"  Tile {i + 1}/{n_tiles} ({100 * (i + 1) // n_tiles}%)")
 
             # Extract tile from numpy array (stays on CPU)
@@ -536,13 +554,13 @@ class TileManager:
             if (i + 1) % 4 == 0 or i == n_tiles - 1:
                 self.dm.clear_cache()
 
-        if verbose:
+        if verbose and not HAS_TQDM:
             print("  Merging tiles with phase alignment...")
 
         # Merge results with phase alignment (entirely on CPU using numpy)
-        result = self._merge_tiles_numpy(processed_tiles_np, (H, W))
+        result = self._merge_tiles_numpy(processed_tiles_np, (H, W), verbose=verbose)
 
-        if verbose:
+        if verbose and not HAS_TQDM:
             print("  Done.")
 
         return result
@@ -680,6 +698,7 @@ class TileManager:
         self,
         tiles_data: list[tuple[TileInfo, np.ndarray]],
         shape: tuple[int, int],
+        verbose: bool = False,
     ) -> np.ndarray:
         """
         Merge processed tiles back into a full image (numpy/CPU version).
@@ -694,6 +713,8 @@ class TileManager:
 
         # Align phase offsets between tiles
         if len(tiles_data) > 1:
+            if verbose and HAS_TQDM:
+                print("Aligning tile phases...")
             tiles_data = self._align_tile_phases_numpy(tiles_data)
 
         # Accumulators for weighted average (CPU memory)

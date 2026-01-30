@@ -28,7 +28,7 @@ def unwrap(
     algorithm: AlgorithmType = "auto",
     device: DeviceType = "auto",
     ntiles: tuple[int, int] | None = None,
-    tile_overlap: int = 64,
+    tile_overlap: int | None = None,
     max_iterations: int = 50,
     tolerance: float = 1e-4,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -62,8 +62,9 @@ def unwrap(
     ntiles : tuple of int, optional
         If provided, splits image into (nrow, ncol) tiles for processing.
         Useful for large images that don't fit in GPU memory.
-    tile_overlap : int
-        Overlap in pixels between tiles (default 64).
+    tile_overlap : int, optional
+        Overlap in pixels between tiles. If None (default), automatically
+        calculated as 10% of the smaller tile dimension for good blending.
     max_iterations : int
         Maximum IRLS iterations (default 50, only for algorithm="irls").
     tolerance : float
@@ -146,13 +147,15 @@ def unwrap(
     if ntiles is not None:
         # Memory-efficient path: keep data as numpy, only convert tiles to GPU
         n_rows, n_cols = ntiles
-        n_total_tiles = n_rows * n_cols
         tile_h = phase.shape[0] // n_rows
         tile_w = phase.shape[1] // n_cols
-
-        # Warn if overlap is small relative to tile size
         min_tile_dim = min(tile_h, tile_w)
-        if tile_overlap < min_tile_dim * 0.05:
+
+        # Auto-calculate overlap if not specified (10% of min tile dimension)
+        if tile_overlap is None:
+            tile_overlap = max(64, int(min_tile_dim * 0.1))
+        elif tile_overlap < min_tile_dim * 0.05:
+            # Warn if user-specified overlap is too small
             import warnings
             warnings.warn(
                 f"tile_overlap={tile_overlap} is small relative to tile size "
@@ -193,7 +196,7 @@ def unwrap_dct(
     igram: np.ndarray,
     device: DeviceType = "auto",
     ntiles: tuple[int, int] | None = None,
-    tile_overlap: int = 64,
+    tile_overlap: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Unwrap phase using fast DCT-based least squares.
@@ -209,8 +212,8 @@ def unwrap_dct(
         Compute device: "cuda", "mps", "cpu", or "auto".
     ntiles : tuple of int, optional
         Tile configuration for large images.
-    tile_overlap : int
-        Overlap between tiles.
+    tile_overlap : int, optional
+        Overlap between tiles. Auto-calculated if None.
 
     Returns
     -------
@@ -242,7 +245,7 @@ def unwrap_irls(
     max_iterations: int = 50,
     tolerance: float = 1e-4,
     ntiles: tuple[int, int] | None = None,
-    tile_overlap: int = 64,
+    tile_overlap: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Unwrap phase using IRLS with coherence weighting.
@@ -266,8 +269,8 @@ def unwrap_irls(
         Convergence tolerance.
     ntiles : tuple of int, optional
         Tile configuration for large images.
-    tile_overlap : int
-        Overlap between tiles.
+    tile_overlap : int, optional
+        Overlap between tiles. Auto-calculated if None.
 
     Returns
     -------
@@ -303,7 +306,7 @@ def unwrap_irls_cg(
     tolerance: float = 1e-4,
     delta: float = 0.1,
     ntiles: tuple[int, int] | None = None,
-    tile_overlap: int = 64,
+    tile_overlap: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Unwrap phase using IRLS with Conjugate Gradient solver.
@@ -331,8 +334,8 @@ def unwrap_irls_cg(
         L1 more closely but may cause instability (default 0.1).
     ntiles : tuple of int, optional
         Tile configuration for large images.
-    tile_overlap : int
-        Overlap between tiles.
+    tile_overlap : int, optional
+        Overlap between tiles. Auto-calculated if None.
 
     Returns
     -------
