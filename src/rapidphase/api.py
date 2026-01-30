@@ -145,6 +145,22 @@ def unwrap(
     # Process with or without tiling
     if ntiles is not None:
         # Memory-efficient path: keep data as numpy, only convert tiles to GPU
+        n_rows, n_cols = ntiles
+        n_total_tiles = n_rows * n_cols
+        tile_h = phase.shape[0] // n_rows
+        tile_w = phase.shape[1] // n_cols
+
+        # Warn if overlap is small relative to tile size
+        min_tile_dim = min(tile_h, tile_w)
+        if tile_overlap < min_tile_dim * 0.05:
+            import warnings
+            warnings.warn(
+                f"tile_overlap={tile_overlap} is small relative to tile size "
+                f"({tile_h}x{tile_w}). Consider using overlap of at least "
+                f"{int(min_tile_dim * 0.1)} pixels for better blending.",
+                UserWarning,
+            )
+
         tile_manager = TileManager(dm, ntiles=ntiles, overlap=tile_overlap)
 
         def process_tile(tile_phase, tile_coh=None, tile_nan_mask=None):
@@ -152,7 +168,7 @@ def unwrap(
 
         # Use numpy-based tiling to avoid loading entire image to GPU
         unw = tile_manager.process_tiled_numpy(
-            phase, process_tile, coherence, nan_mask
+            phase, process_tile, coherence, nan_mask, verbose=True
         )
     else:
         # Standard path: convert entire image to GPU tensors

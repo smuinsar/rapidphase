@@ -461,6 +461,7 @@ class TileManager:
         process_fn: Callable[[torch.Tensor, torch.Tensor | None, torch.Tensor | None], torch.Tensor],
         coherence: np.ndarray | None = None,
         nan_mask: np.ndarray | None = None,
+        verbose: bool = True,
     ) -> np.ndarray:
         """
         Process an image tile-by-tile with memory-efficient numpy I/O.
@@ -480,6 +481,8 @@ class TileManager:
             Coherence map of shape (H, W) as numpy array.
         nan_mask : np.ndarray, optional
             Boolean mask of shape (H, W) indicating invalid pixels.
+        verbose : bool
+            If True, print progress information.
 
         Returns
         -------
@@ -488,11 +491,18 @@ class TileManager:
         """
         H, W = image.shape
         tiles = self.compute_tiles((H, W))
+        n_tiles = len(tiles)
+
+        if verbose:
+            print(f"Processing {n_tiles} tiles ({self.ntiles[0]}x{self.ntiles[1]})...")
 
         # Store processed tiles as numpy arrays (CPU memory)
         processed_tiles_np: list[tuple[TileInfo, np.ndarray]] = []
 
-        for tile in tiles:
+        for i, tile in enumerate(tiles):
+            if verbose and (i % max(1, n_tiles // 10) == 0 or i == n_tiles - 1):
+                print(f"  Tile {i + 1}/{n_tiles} ({100 * (i + 1) // n_tiles}%)")
+
             # Extract tile from numpy array (stays on CPU)
             tile_data_np = image[tile.row_start:tile.row_end, tile.col_start:tile.col_end].copy()
 
@@ -520,12 +530,22 @@ class TileManager:
             result_np = self.dm.to_numpy(result_t)
             processed_tiles_np.append((tile, result_np))
 
-            # Clear GPU tensors to free memory
+            # Clear GPU tensors to free memory (but not too frequently - it's expensive)
             del tile_data_t, coh_tile_t, nan_mask_tile_t, result_t
-            self.dm.clear_cache()
+            # Only clear cache every 4 tiles or at the end
+            if (i + 1) % 4 == 0 or i == n_tiles - 1:
+                self.dm.clear_cache()
+
+        if verbose:
+            print("  Merging tiles with phase alignment...")
 
         # Merge results with phase alignment (entirely on CPU using numpy)
-        return self._merge_tiles_numpy(processed_tiles_np, (H, W))
+        result = self._merge_tiles_numpy(processed_tiles_np, (H, W))
+
+        if verbose:
+            print("  Done.")
+
+        return result
 
     def _align_tile_phases_numpy(
         self,
@@ -537,6 +557,8 @@ class TileManager:
         Each tile from phase unwrapping has an arbitrary constant offset.
         This method computes and applies corrections so that overlapping
         regions have consistent phase values.
+
+        Uses the center band of the overlap region to avoid edge artifacts.
         """
         if len(tiles_data) <= 1:
             return tiles_data
@@ -588,16 +610,35 @@ class TileManager:
                 if overlap_row_start >= overlap_row_end or overlap_col_start >= overlap_col_end:
                     continue
 
-                # Extract overlap regions from both tiles (in local coordinates)
-                curr_local_row_start = overlap_row_start - curr_tile.row_start
-                curr_local_row_end = overlap_row_end - curr_tile.row_start
-                curr_local_col_start = overlap_col_start - curr_tile.col_start
-                curr_local_col_end = overlap_col_end - curr_tile.col_start
+                # Use center 50% of overlap region to avoid edge artifacts
+                overlap_h = overlap_row_end - overlap_row_start
+                overlap_w = overlap_col_end - overlap_col_start
+                margin_h = overlap_h // 4
+                margin_w = overlap_w // 4
 
-                neighbor_local_row_start = overlap_row_start - neighbor_tile.row_start
-                neighbor_local_row_end = overlap_row_end - neighbor_tile.row_start
-                neighbor_local_col_start = overlap_col_start - neighbor_tile.col_start
-                neighbor_local_col_end = overlap_col_end - neighbor_tile.col_start
+                center_row_start = overlap_row_start + margin_h
+                center_row_end = overlap_row_end - margin_h
+                center_col_start = overlap_col_start + margin_w
+                center_col_end = overlap_col_end - margin_w
+
+                # Ensure we have at least some pixels
+                if center_row_start >= center_row_end:
+                    center_row_start = overlap_row_start
+                    center_row_end = overlap_row_end
+                if center_col_start >= center_col_end:
+                    center_col_start = overlap_col_start
+                    center_col_end = overlap_col_end
+
+                # Extract center overlap regions from both tiles (in local coordinates)
+                curr_local_row_start = center_row_start - curr_tile.row_start
+                curr_local_row_end = center_row_end - curr_tile.row_start
+                curr_local_col_start = center_col_start - curr_tile.col_start
+                curr_local_col_end = center_col_end - curr_tile.col_start
+
+                neighbor_local_row_start = center_row_start - neighbor_tile.row_start
+                neighbor_local_row_end = center_row_end - neighbor_tile.row_start
+                neighbor_local_col_start = center_col_start - neighbor_tile.col_start
+                neighbor_local_col_end = center_col_end - neighbor_tile.col_start
 
                 curr_overlap = curr_data[
                     curr_local_row_start:curr_local_row_end,
@@ -644,6 +685,10 @@ class TileManager:
         Merge processed tiles back into a full image (numpy/CPU version).
 
         Memory-efficient implementation that keeps all data on CPU.
+
+        The blending strategy uses the DATA boundaries (not extended boundaries)
+        to determine where feathering occurs. Each tile has full weight in the
+        center of its data region and ramps down in the overlap regions.
         """
         H, W = shape
 
@@ -655,48 +700,43 @@ class TileManager:
         result = np.zeros((H, W), dtype=np.float64)
         weight_sum = np.zeros((H, W), dtype=np.float64)
 
-        # Feather width (use most of the overlap for smooth blending)
-        feather = max(1, int(self.overlap * 0.8))
-
         for tile, data in tiles_data:
             tile_H, tile_W = data.shape
 
-            # Create blend weights (numpy version)
+            # Create blend weights based on DATA boundaries
+            # The overlap region is between row_start and data_row_start (top)
+            # and between data_row_end and row_end (bottom)
             weights = np.ones((tile_H, tile_W), dtype=np.float64)
 
-            # Top edge feathering
-            if tile.row_start > 0 and feather < tile_H:
-                t = np.linspace(0, 1, feather + 1)[1:]
+            # Top overlap region: ramp from 0 at row_start to 1 at data_row_start
+            top_overlap = tile.data_row_start - tile.row_start
+            if top_overlap > 0:
+                t = np.linspace(0, 1, top_overlap + 1)[1:]  # exclude 0, include 1
                 ramp = 0.5 * (1 - np.cos(t * np.pi))
-                ramp_full = np.ones(tile_H)
-                ramp_full[:feather] = ramp
-                weights = weights * ramp_full[:, np.newaxis]
+                weights[:top_overlap, :] *= ramp[:, np.newaxis]
 
-            # Bottom edge feathering
-            if tile.row_end < H and feather < tile_H:
-                t = np.linspace(0, 1, feather + 1)[1:]
+            # Bottom overlap region: ramp from 1 at data_row_end to 0 at row_end
+            bottom_overlap = tile.row_end - tile.data_row_end
+            if bottom_overlap > 0:
+                t = np.linspace(0, 1, bottom_overlap + 1)[1:]
                 ramp = 0.5 * (1 - np.cos(t * np.pi))
-                ramp_full = np.ones(tile_H)
-                ramp_full[:feather] = ramp
-                ramp_full = ramp_full[::-1]
-                weights = weights * ramp_full[:, np.newaxis]
+                ramp = ramp[::-1]  # reverse: 1 -> 0
+                weights[-bottom_overlap:, :] *= ramp[:, np.newaxis]
 
-            # Left edge feathering
-            if tile.col_start > 0 and feather < tile_W:
-                t = np.linspace(0, 1, feather + 1)[1:]
+            # Left overlap region: ramp from 0 at col_start to 1 at data_col_start
+            left_overlap = tile.data_col_start - tile.col_start
+            if left_overlap > 0:
+                t = np.linspace(0, 1, left_overlap + 1)[1:]
                 ramp = 0.5 * (1 - np.cos(t * np.pi))
-                ramp_full = np.ones(tile_W)
-                ramp_full[:feather] = ramp
-                weights = weights * ramp_full[np.newaxis, :]
+                weights[:, :left_overlap] *= ramp[np.newaxis, :]
 
-            # Right edge feathering
-            if tile.col_end < W and feather < tile_W:
-                t = np.linspace(0, 1, feather + 1)[1:]
+            # Right overlap region: ramp from 1 at data_col_end to 0 at col_end
+            right_overlap = tile.col_end - tile.data_col_end
+            if right_overlap > 0:
+                t = np.linspace(0, 1, right_overlap + 1)[1:]
                 ramp = 0.5 * (1 - np.cos(t * np.pi))
-                ramp_full = np.ones(tile_W)
-                ramp_full[:feather] = ramp
-                ramp_full = ramp_full[::-1]
-                weights = weights * ramp_full[np.newaxis, :]
+                ramp = ramp[::-1]
+                weights[:, -right_overlap:] *= ramp[np.newaxis, :]
 
             # Create mask for valid (non-NaN) pixels
             valid_mask = ~np.isnan(data)
