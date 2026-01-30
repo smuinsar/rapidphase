@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
+import numpy as np
 import torch
 
 if TYPE_CHECKING:
@@ -453,6 +454,276 @@ class TileManager:
 
         # Merge results with phase alignment
         return self.merge_tiles(processed_tiles, (H, W), align_phases=True)
+
+    def process_tiled_numpy(
+        self,
+        image: np.ndarray,
+        process_fn: Callable[[torch.Tensor, torch.Tensor | None, torch.Tensor | None], torch.Tensor],
+        coherence: np.ndarray | None = None,
+        nan_mask: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """
+        Process an image tile-by-tile with memory-efficient numpy I/O.
+
+        This method keeps the full image in CPU memory (as numpy arrays) and only
+        transfers individual tiles to GPU for processing. This enables processing
+        of images much larger than GPU memory.
+
+        Parameters
+        ----------
+        image : np.ndarray
+            Input image of shape (H, W) as numpy array.
+        process_fn : callable
+            Function to apply to each tile.
+            Should take (tile_tensor, coherence_tile, nan_mask_tile) and return processed tile tensor.
+        coherence : np.ndarray, optional
+            Coherence map of shape (H, W) as numpy array.
+        nan_mask : np.ndarray, optional
+            Boolean mask of shape (H, W) indicating invalid pixels.
+
+        Returns
+        -------
+        np.ndarray
+            Processed image of shape (H, W) as numpy array.
+        """
+        H, W = image.shape
+        tiles = self.compute_tiles((H, W))
+
+        # Store processed tiles as numpy arrays (CPU memory)
+        processed_tiles_np: list[tuple[TileInfo, np.ndarray]] = []
+
+        for tile in tiles:
+            # Extract tile from numpy array (stays on CPU)
+            tile_data_np = image[tile.row_start:tile.row_end, tile.col_start:tile.col_end].copy()
+
+            # Extract coherence tile if available
+            coh_tile_np = None
+            if coherence is not None:
+                coh_tile_np = coherence[tile.row_start:tile.row_end, tile.col_start:tile.col_end].copy()
+
+            # Extract nan_mask tile if available
+            nan_mask_tile_np = None
+            if nan_mask is not None:
+                nan_mask_tile_np = nan_mask[tile.row_start:tile.row_end, tile.col_start:tile.col_end].copy()
+
+            # Convert tile to GPU tensor
+            tile_data_t = self.dm.to_tensor(tile_data_np)
+            coh_tile_t = self.dm.to_tensor(coh_tile_np) if coh_tile_np is not None else None
+            nan_mask_tile_t = None
+            if nan_mask_tile_np is not None:
+                nan_mask_tile_t = self.dm.to_tensor(nan_mask_tile_np.astype(np.float32)) > 0.5
+
+            # Process tile on GPU
+            result_t = process_fn(tile_data_t, coh_tile_t, nan_mask_tile_t)
+
+            # Move result back to CPU numpy and store
+            result_np = self.dm.to_numpy(result_t)
+            processed_tiles_np.append((tile, result_np))
+
+            # Clear GPU tensors to free memory
+            del tile_data_t, coh_tile_t, nan_mask_tile_t, result_t
+            self.dm.clear_cache()
+
+        # Merge results with phase alignment (entirely on CPU using numpy)
+        return self._merge_tiles_numpy(processed_tiles_np, (H, W))
+
+    def _align_tile_phases_numpy(
+        self,
+        tiles_data: list[tuple[TileInfo, np.ndarray]],
+    ) -> list[tuple[TileInfo, np.ndarray]]:
+        """
+        Align phase offsets between adjacent tiles (numpy/CPU version).
+
+        Each tile from phase unwrapping has an arbitrary constant offset.
+        This method computes and applies corrections so that overlapping
+        regions have consistent phase values.
+        """
+        if len(tiles_data) <= 1:
+            return tiles_data
+
+        n_rows, n_cols = self.ntiles
+
+        # Create a dictionary for easy lookup by (row, col) index
+        tile_dict = {}
+        for tile, data in tiles_data:
+            tile_dict[(tile.row_idx, tile.col_idx)] = (tile, data.copy())
+
+        # Track which tiles have been aligned
+        aligned = set()
+        # Store offsets to apply
+        offsets = {(0, 0): 0.0}  # First tile is reference
+        aligned.add((0, 0))
+
+        # BFS to propagate alignment from tile (0,0)
+        queue = [(0, 0)]
+
+        while queue:
+            curr_idx = queue.pop(0)
+            curr_tile, curr_data = tile_dict[curr_idx]
+            curr_offset = offsets[curr_idx]
+
+            # Check all neighbors (right and down primarily, but also left and up)
+            neighbors = [
+                (curr_idx[0], curr_idx[1] + 1),  # right
+                (curr_idx[0] + 1, curr_idx[1]),  # down
+                (curr_idx[0], curr_idx[1] - 1),  # left
+                (curr_idx[0] - 1, curr_idx[1]),  # up
+            ]
+
+            for neighbor_idx in neighbors:
+                if neighbor_idx in aligned:
+                    continue
+                if neighbor_idx not in tile_dict:
+                    continue
+
+                neighbor_tile, neighbor_data = tile_dict[neighbor_idx]
+
+                # Find overlapping region in global coordinates
+                overlap_row_start = max(curr_tile.row_start, neighbor_tile.row_start)
+                overlap_row_end = min(curr_tile.row_end, neighbor_tile.row_end)
+                overlap_col_start = max(curr_tile.col_start, neighbor_tile.col_start)
+                overlap_col_end = min(curr_tile.col_end, neighbor_tile.col_end)
+
+                # Check if there's actual overlap
+                if overlap_row_start >= overlap_row_end or overlap_col_start >= overlap_col_end:
+                    continue
+
+                # Extract overlap regions from both tiles (in local coordinates)
+                curr_local_row_start = overlap_row_start - curr_tile.row_start
+                curr_local_row_end = overlap_row_end - curr_tile.row_start
+                curr_local_col_start = overlap_col_start - curr_tile.col_start
+                curr_local_col_end = overlap_col_end - curr_tile.col_start
+
+                neighbor_local_row_start = overlap_row_start - neighbor_tile.row_start
+                neighbor_local_row_end = overlap_row_end - neighbor_tile.row_start
+                neighbor_local_col_start = overlap_col_start - neighbor_tile.col_start
+                neighbor_local_col_end = overlap_col_end - neighbor_tile.col_start
+
+                curr_overlap = curr_data[
+                    curr_local_row_start:curr_local_row_end,
+                    curr_local_col_start:curr_local_col_end
+                ]
+                neighbor_overlap = neighbor_data[
+                    neighbor_local_row_start:neighbor_local_row_end,
+                    neighbor_local_col_start:neighbor_local_col_end
+                ]
+
+                # Compute offset: neighbor should match curr (after curr's offset is applied)
+                # Use median for robustness to outliers
+                diff = (curr_overlap + curr_offset) - neighbor_overlap
+
+                # Handle NaN values by masking them out before computing median
+                valid_mask = ~np.isnan(diff)
+                if valid_mask.any():
+                    valid_diff = diff[valid_mask]
+                    offset = float(np.median(valid_diff))
+                else:
+                    # No valid overlap, use zero offset
+                    offset = 0.0
+
+                offsets[neighbor_idx] = offset
+                aligned.add(neighbor_idx)
+                queue.append(neighbor_idx)
+
+        # Apply offsets to all tiles
+        aligned_tiles = []
+        for tile, data in tiles_data:
+            idx = (tile.row_idx, tile.col_idx)
+            offset = offsets.get(idx, 0.0)
+            aligned_data = data + offset
+            aligned_tiles.append((tile, aligned_data))
+
+        return aligned_tiles
+
+    def _merge_tiles_numpy(
+        self,
+        tiles_data: list[tuple[TileInfo, np.ndarray]],
+        shape: tuple[int, int],
+    ) -> np.ndarray:
+        """
+        Merge processed tiles back into a full image (numpy/CPU version).
+
+        Memory-efficient implementation that keeps all data on CPU.
+        """
+        H, W = shape
+
+        # Align phase offsets between tiles
+        if len(tiles_data) > 1:
+            tiles_data = self._align_tile_phases_numpy(tiles_data)
+
+        # Accumulators for weighted average (CPU memory)
+        result = np.zeros((H, W), dtype=np.float64)
+        weight_sum = np.zeros((H, W), dtype=np.float64)
+
+        # Feather width (use most of the overlap for smooth blending)
+        feather = max(1, int(self.overlap * 0.8))
+
+        for tile, data in tiles_data:
+            tile_H, tile_W = data.shape
+
+            # Create blend weights (numpy version)
+            weights = np.ones((tile_H, tile_W), dtype=np.float64)
+
+            # Top edge feathering
+            if tile.row_start > 0 and feather < tile_H:
+                t = np.linspace(0, 1, feather + 1)[1:]
+                ramp = 0.5 * (1 - np.cos(t * np.pi))
+                ramp_full = np.ones(tile_H)
+                ramp_full[:feather] = ramp
+                weights = weights * ramp_full[:, np.newaxis]
+
+            # Bottom edge feathering
+            if tile.row_end < H and feather < tile_H:
+                t = np.linspace(0, 1, feather + 1)[1:]
+                ramp = 0.5 * (1 - np.cos(t * np.pi))
+                ramp_full = np.ones(tile_H)
+                ramp_full[:feather] = ramp
+                ramp_full = ramp_full[::-1]
+                weights = weights * ramp_full[:, np.newaxis]
+
+            # Left edge feathering
+            if tile.col_start > 0 and feather < tile_W:
+                t = np.linspace(0, 1, feather + 1)[1:]
+                ramp = 0.5 * (1 - np.cos(t * np.pi))
+                ramp_full = np.ones(tile_W)
+                ramp_full[:feather] = ramp
+                weights = weights * ramp_full[np.newaxis, :]
+
+            # Right edge feathering
+            if tile.col_end < W and feather < tile_W:
+                t = np.linspace(0, 1, feather + 1)[1:]
+                ramp = 0.5 * (1 - np.cos(t * np.pi))
+                ramp_full = np.ones(tile_W)
+                ramp_full[:feather] = ramp
+                ramp_full = ramp_full[::-1]
+                weights = weights * ramp_full[np.newaxis, :]
+
+            # Create mask for valid (non-NaN) pixels
+            valid_mask = ~np.isnan(data)
+
+            # Zero out weights for NaN pixels
+            effective_weights = weights.copy()
+            effective_weights[~valid_mask] = 0.0
+
+            # Replace NaN with 0 for accumulation (will be masked by weights)
+            safe_data = data.copy()
+            safe_data[~valid_mask] = 0.0
+
+            # Add weighted contribution
+            result[tile.row_start:tile.row_end, tile.col_start:tile.col_end] += (
+                effective_weights * safe_data
+            )
+            weight_sum[tile.row_start:tile.row_end, tile.col_start:tile.col_end] += (
+                effective_weights
+            )
+
+        # Normalize by weight sum
+        # Pixels with zero weight sum had no valid data - set to NaN
+        valid_output = weight_sum > 1e-10
+        result[valid_output] = result[valid_output] / weight_sum[valid_output]
+        result[~valid_output] = np.nan
+
+        return result
 
     def process_tiled_batch(
         self,

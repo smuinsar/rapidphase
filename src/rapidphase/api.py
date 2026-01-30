@@ -142,34 +142,28 @@ def unwrap(
     else:
         raise ValueError(f"Unknown algorithm: {algorithm}")
 
-    # Convert to tensors
-    phase_t = dm.to_tensor(phase)
-    coh_t = dm.to_tensor(coherence) if coherence is not None else None
-    nan_mask_t = dm.to_tensor(nan_mask.astype(np.float32)) > 0.5  # Convert to bool tensor
-
     # Process with or without tiling
     if ntiles is not None:
+        # Memory-efficient path: keep data as numpy, only convert tiles to GPU
         tile_manager = TileManager(dm, ntiles=ntiles, overlap=tile_overlap)
 
         def process_tile(tile_phase, tile_coh=None, tile_nan_mask=None):
             return unwrapper.unwrap(tile_phase, tile_coh, nan_mask=tile_nan_mask)
 
-        if coh_t is not None:
-            unw_t = tile_manager.process_tiled(
-                phase_t, process_tile, coh_t, nan_mask_t
-            )
-        else:
-            unw_t = tile_manager.process_tiled(
-                phase_t,
-                lambda x, nm: unwrapper.unwrap(x, None, nan_mask=nm),
-                None,
-                nan_mask_t,
-            )
+        # Use numpy-based tiling to avoid loading entire image to GPU
+        unw = tile_manager.process_tiled_numpy(
+            phase, process_tile, coherence, nan_mask
+        )
     else:
+        # Standard path: convert entire image to GPU tensors
+        phase_t = dm.to_tensor(phase)
+        coh_t = dm.to_tensor(coherence) if coherence is not None else None
+        nan_mask_t = dm.to_tensor(nan_mask.astype(np.float32)) > 0.5  # Convert to bool tensor
+
         unw_t = unwrapper.unwrap(phase_t, coh_t, nan_mask=nan_mask_t)
 
-    # Convert back to numpy
-    unw = dm.to_numpy(unw_t)
+        # Convert back to numpy
+        unw = dm.to_numpy(unw_t)
 
     # Create connected component array
     # Mark NaN regions as component 0 (invalid), valid regions as 1
