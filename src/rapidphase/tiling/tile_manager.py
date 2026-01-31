@@ -21,6 +21,13 @@ try:
 except ImportError:
     HAS_TQDM = False
 
+# Try to import GPUtil for accurate GPU availability detection on HPC
+try:
+    import GPUtil
+    HAS_GPUTIL = True
+except ImportError:
+    HAS_GPUTIL = False
+
 if TYPE_CHECKING:
     from rapidphase.device.manager import DeviceManager
 
@@ -72,6 +79,38 @@ class TileManager:
         self.dm = device_manager
         self.ntiles = ntiles
         self.overlap = overlap
+
+    def _get_available_gpu_ids(self) -> list[int]:
+        """
+        Get list of available GPU IDs.
+
+        Uses GPUtil if available (recommended for HPC systems) to detect
+        actually available GPUs. Falls back to torch.cuda.device_count().
+
+        Returns
+        -------
+        list of int
+            List of available GPU device IDs.
+        """
+        if not torch.cuda.is_available():
+            return []
+
+        if HAS_GPUTIL:
+            # Use GPUtil to find available GPUs (respects HPC allocations)
+            try:
+                gpu_ids = GPUtil.getAvailable(
+                    order='first',
+                    limit=100,  # Get all available
+                    maxLoad=0.9,  # GPUs with <90% load
+                    maxMemory=0.9,  # GPUs with <90% memory used
+                )
+                if gpu_ids:
+                    return gpu_ids
+            except Exception:
+                pass  # Fall back to torch
+
+        # Fall back to torch - return all visible GPUs
+        return list(range(torch.cuda.device_count()))
 
     def compute_tiles(
         self,
@@ -469,6 +508,7 @@ class TileManager:
         unwrapper_factory: Callable,
         coherence: np.ndarray | None = None,
         nan_mask: np.ndarray | None = None,
+        n_gpus: int | None = None,
         verbose: bool = True,
     ) -> np.ndarray:
         """
@@ -491,6 +531,9 @@ class TileManager:
             Coherence map of shape (H, W) as numpy array.
         nan_mask : np.ndarray, optional
             Boolean mask of shape (H, W) indicating invalid pixels.
+        n_gpus : int, optional
+            Number of GPUs to use. If None, uses all available GPUs.
+            Set explicitly on HPC systems where not all GPUs may be allocated.
         verbose : bool
             If True, print progress information.
 
@@ -503,13 +546,29 @@ class TileManager:
         tiles = self.compute_tiles((H, W))
         n_tiles = len(tiles)
 
-        # Check for multi-GPU availability
-        n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        # Determine number of GPUs to use
+        available_gpu_ids = self._get_available_gpu_ids()
+        available_gpus = len(available_gpu_ids)
 
-        if n_gpus > 1 and self.dm.device_type == "cuda":
+        if n_gpus is None:
+            use_n_gpus = available_gpus
+            use_gpu_ids = available_gpu_ids
+        else:
+            # Validate user-specified GPU count
+            if n_gpus > available_gpus and available_gpus > 0:
+                import warnings
+                warnings.warn(
+                    f"Requested {n_gpus} GPUs but only {available_gpus} available. "
+                    f"Using {available_gpus} GPUs.",
+                    UserWarning,
+                )
+            use_n_gpus = min(n_gpus, available_gpus) if available_gpus > 0 else 0
+            use_gpu_ids = available_gpu_ids[:use_n_gpus]
+
+        if use_n_gpus > 1 and self.dm.device_type == "cuda":
             # Multi-GPU parallel processing
             return self._process_tiled_multi_gpu(
-                image, unwrapper_factory, coherence, nan_mask, tiles, n_gpus, verbose
+                image, unwrapper_factory, coherence, nan_mask, tiles, use_gpu_ids, verbose
             )
         else:
             # Single device processing
@@ -605,7 +664,7 @@ class TileManager:
         coherence: np.ndarray | None,
         nan_mask: np.ndarray | None,
         tiles: list[TileInfo],
-        n_gpus: int,
+        gpu_ids: list[int],
         verbose: bool,
     ) -> np.ndarray:
         """Multi-GPU parallel tile processing."""
@@ -614,9 +673,10 @@ class TileManager:
 
         H, W = image.shape
         n_tiles = len(tiles)
+        n_gpus = len(gpu_ids)
 
         if verbose:
-            print(f"Processing {n_tiles} tiles on {n_gpus} GPUs in parallel...")
+            print(f"Processing {n_tiles} tiles on {n_gpus} GPUs (IDs: {gpu_ids}) in parallel...")
 
         # Group tiles by GPU (round-robin assignment)
         tiles_per_gpu: list[list[tuple[int, TileInfo]]] = [[] for _ in range(n_gpus)]
@@ -690,8 +750,8 @@ class TileManager:
         # Process tiles in parallel - one thread per GPU
         with ThreadPoolExecutor(max_workers=n_gpus) as executor:
             futures = [
-                executor.submit(process_gpu_tiles, gpu_id, tiles_per_gpu[gpu_id])
-                for gpu_id in range(n_gpus)
+                executor.submit(process_gpu_tiles, gpu_ids[i], tiles_per_gpu[i])
+                for i in range(n_gpus)
             ]
             # Wait for all to complete
             for future in futures:

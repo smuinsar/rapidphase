@@ -29,6 +29,7 @@ def unwrap(
     device: DeviceType = "auto",
     ntiles: tuple[int, int] | None = None,
     tile_overlap: int | None = None,
+    n_gpus: int | None = None,
     max_iterations: int = 50,
     tolerance: float = 1e-4,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -65,6 +66,10 @@ def unwrap(
     tile_overlap : int, optional
         Overlap in pixels between tiles. If None (default), automatically
         calculated as 10% of the smaller tile dimension for good blending.
+    n_gpus : int, optional
+        Number of GPUs to use for parallel tile processing. If None (default),
+        uses all available GPUs. Set this explicitly on HPC systems where
+        torch.cuda.device_count() may return more GPUs than allocated.
     max_iterations : int
         Maximum IRLS iterations (default 50, only for algorithm="irls").
     tolerance : float
@@ -191,6 +196,7 @@ def unwrap(
             unwrapper_factory=create_unwrapper_for_device,
             coherence=coherence,
             nan_mask=nan_mask,
+            n_gpus=n_gpus,
             verbose=True,
         )
     else:
