@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rapidphase"
-version = "0.1.1"
+version = "0.1.2"
 description = "Fast GPU-accelerated phase unwrapping using PyTorch (CUDA/MPS/CPU)"
 readme = "README.md"
 license = {text = "MIT"}
