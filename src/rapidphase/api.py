@@ -420,6 +420,7 @@ def goldstein_filter(
     patch_batch_size: int = 1024,
     device: DeviceType = "auto",
     n_gpus: int | None = None,
+    ntiles: tuple[int, int] | str = "auto",
     verbose: bool = False,
 ) -> np.ndarray:
     """
@@ -453,13 +454,17 @@ def goldstein_filter(
     device : str
         Compute device: "cuda", "mps", "cpu", or "auto" (default).
         "auto" selects best available (CUDA > MPS > CPU).
-        Ignored when n_gpus > 1 (uses CUDA devices directly).
     n_gpus : int, optional
         Number of GPUs to use for parallel processing. If None (default),
-        uses single-GPU mode. Set to number of GPUs for multi-GPU parallel
-        processing on large images.
+        uses all available GPUs. Set to 1 for single-GPU mode.
+    ntiles : tuple of int or str
+        Number of tiles in (row, col) directions for memory-efficient
+        processing. Use "auto" (default) to automatically determine based
+        on image size and available GPU memory. Use explicit values like
+        (2, 2) for 4 tiles, (4, 4) for 16 tiles, etc. Larger images need
+        more tiles to fit in GPU memory.
     verbose : bool
-        If True, print progress information for multi-GPU processing.
+        If True, print progress information.
 
     Returns
     -------
@@ -479,13 +484,13 @@ def goldstein_filter(
     NaN and zero values are masked during processing and restored afterward.
     The triangular window weighting ensures smooth blending between patches.
 
-    For large images on GPU, patches are processed in batches to manage memory.
-    If you encounter out-of-memory errors, reduce patch_batch_size (e.g., 256
-    or 128) rather than switching to CPU.
+    For large images, the image is split into tiles that are processed
+    sequentially (or in parallel on multiple GPUs). This keeps memory usage
+    bounded regardless of image size. The tiles are merged with smooth
+    cosine blending to avoid visible boundaries.
 
-    When using multiple GPUs (n_gpus > 1), the image is split into horizontal
-    strips and processed in parallel across GPUs, then merged with smooth
-    blending.
+    When using multiple GPUs (n_gpus > 1 or n_gpus=None with multiple GPUs
+    available), tiles are distributed across GPUs for parallel processing.
 
     Examples
     --------
@@ -503,13 +508,17 @@ def goldstein_filter(
 
     >>> filtered = rapidphase.goldstein_filter(igram, device="cuda")
 
+    Large image with explicit tiling (for memory efficiency):
+
+    >>> filtered = rapidphase.goldstein_filter(igram, ntiles=(4, 4), verbose=True)
+
     Multi-GPU filtering for large images:
 
-    >>> filtered = rapidphase.goldstein_filter(igram, n_gpus=4, verbose=True)
+    >>> filtered = rapidphase.goldstein_filter(igram, ntiles=(8, 8), verbose=True)
 
-    Large image with limited GPU memory:
+    Single GPU mode (use only one GPU even if multiple available):
 
-    >>> filtered = rapidphase.goldstein_filter(igram, patch_batch_size=256, device="cuda")
+    >>> filtered = rapidphase.goldstein_filter(igram, n_gpus=1)
 
     References
     ----------
@@ -522,9 +531,10 @@ def goldstein_filter(
     """
     from rapidphase.filtering.goldstein import filter_multi_gpu
 
-    # Use multi-GPU path for CUDA devices
+    # Use multi-GPU path with tiling for memory efficiency
     # n_gpus=None -> use all available GPUs
     # n_gpus=N -> use N GPUs
+    # ntiles="auto" -> automatically determine tile count based on image/GPU size
     return filter_multi_gpu(
         igram,
         alpha=alpha,
@@ -533,5 +543,6 @@ def goldstein_filter(
         patch_batch_size=patch_batch_size,
         n_gpus=n_gpus,
         device=device,
+        ntiles=ntiles,
         verbose=verbose,
     )

@@ -468,13 +468,14 @@ def filter_multi_gpu(
     patch_batch_size: int = 1024,
     n_gpus: int | None = None,
     device: str = "auto",
+    ntiles: tuple[int, int] | str = "auto",
     verbose: bool = True,
 ) -> np.ndarray:
     """
-    Apply Goldstein filter using multiple GPUs in parallel.
+    Apply Goldstein filter using multiple GPUs in parallel with tiling.
 
-    Splits the image into horizontal strips, processes each strip on a
-    separate GPU, and merges the results with smooth blending.
+    For large images, splits into tiles that fit in GPU memory. Each tile
+    is processed separately and results are merged with smooth blending.
 
     Parameters
     ----------
@@ -493,6 +494,10 @@ def filter_multi_gpu(
     device : str
         Fallback device when multi-GPU is not available: "cuda", "mps",
         "cpu", or "auto" (default).
+    ntiles : tuple of int or str
+        Number of tiles in (row, col) directions. Use "auto" (default) to
+        automatically determine based on image size and available GPU memory.
+        For explicit control, use e.g. (2, 2) for 4 tiles.
     verbose : bool
         If True, print progress information.
 
@@ -523,9 +528,16 @@ def filter_multi_gpu(
         # n_gpus=None -> use all available GPUs
         use_n_gpus = available_gpus
 
-    # Fall back to single device if multi-GPU not available
-    if use_n_gpus <= 1:
-        dm = DeviceManager(device)
+    # Determine tiling strategy
+    if ntiles == "auto":
+        ntiles = _auto_compute_ntiles(H, W, use_n_gpus, device)
+
+    n_row_tiles, n_col_tiles = ntiles
+    n_total_tiles = n_row_tiles * n_col_tiles
+
+    # If only one tile, use single-device path directly
+    if n_total_tiles == 1:
+        dm = DeviceManager(device if use_n_gpus == 0 else "cuda")
         filt = GoldsteinFilter(
             dm,
             alpha=alpha,
@@ -535,46 +547,284 @@ def filter_multi_gpu(
         )
         return filt(igram, return_numpy=True)
 
-    gpu_ids = list(range(use_n_gpus))
+    # Use tiled processing
+    return _filter_tiled(
+        igram,
+        alpha=alpha,
+        window_size=window_size,
+        overlap=overlap,
+        patch_batch_size=patch_batch_size,
+        ntiles=ntiles,
+        n_gpus=use_n_gpus,
+        device=device,
+        verbose=verbose,
+    )
+
+
+def _auto_compute_ntiles(
+    H: int,
+    W: int,
+    n_gpus: int,
+    device: str,
+) -> tuple[int, int]:
+    """
+    Automatically compute number of tiles based on image size and GPU memory.
+
+    Targets tile sizes that fit comfortably in GPU memory with safety margin.
+    """
+    # Estimate memory per pixel for Goldstein filter
+    # Complex input + FFT workspace + accumulator buffers
+    # ~40 bytes per pixel (conservative estimate)
+    bytes_per_pixel = 40
+
+    # Get available GPU memory (use first GPU as reference)
+    if n_gpus > 0 and torch.cuda.is_available():
+        try:
+            # Get free memory on first GPU
+            free_memory = torch.cuda.mem_get_info(0)[0]
+        except Exception:
+            # Fallback: assume 8GB available
+            free_memory = 8 * 1024**3
+    else:
+        # CPU: use 4GB as conservative limit
+        free_memory = 4 * 1024**3
+
+    # Use only 50% of available memory for safety
+    usable_memory = free_memory * 0.5
+
+    # Calculate max pixels per tile
+    max_pixels_per_tile = int(usable_memory / bytes_per_pixel)
+
+    # Current image size
+    total_pixels = H * W
+
+    # If image fits in memory, use 1x1 tiling (or n_gpus horizontal strips)
+    if total_pixels <= max_pixels_per_tile:
+        if n_gpus > 1:
+            # Use horizontal strips for multi-GPU
+            return (n_gpus, 1)
+        return (1, 1)
+
+    # Calculate number of tiles needed
+    tiles_needed = max(1, int(np.ceil(total_pixels / max_pixels_per_tile)))
+
+    # Try to balance tiles across both dimensions
+    # Prefer aspect ratio similar to original image
+    aspect_ratio = H / W if W > 0 else 1.0
+
+    n_row_tiles = max(1, int(np.sqrt(tiles_needed * aspect_ratio)))
+    n_col_tiles = max(1, int(np.ceil(tiles_needed / n_row_tiles)))
+
+    # Ensure we have enough tiles
+    while n_row_tiles * n_col_tiles < tiles_needed:
+        if n_row_tiles <= n_col_tiles:
+            n_row_tiles += 1
+        else:
+            n_col_tiles += 1
+
+    # If using multiple GPUs, adjust to distribute evenly
+    if n_gpus > 1:
+        total_tiles = n_row_tiles * n_col_tiles
+        # Round up to multiple of n_gpus for even distribution
+        if total_tiles % n_gpus != 0:
+            extra = n_gpus - (total_tiles % n_gpus)
+            # Add extra tiles to the smaller dimension
+            if n_row_tiles <= n_col_tiles:
+                n_row_tiles += int(np.ceil(extra / n_col_tiles))
+            else:
+                n_col_tiles += int(np.ceil(extra / n_row_tiles))
+
+    return (n_row_tiles, n_col_tiles)
+
+
+def _filter_tiled(
+    igram: np.ndarray,
+    alpha: float,
+    window_size: int,
+    overlap: float,
+    patch_batch_size: int,
+    ntiles: tuple[int, int],
+    n_gpus: int,
+    device: str,
+    verbose: bool,
+) -> np.ndarray:
+    """
+    Apply Goldstein filter using tiled processing.
+
+    Keeps full image on CPU, transfers tiles to GPU one at a time.
+    Supports multi-GPU parallel processing.
+    """
+    import threading
+
+    from rapidphase.device.manager import DeviceManager
+
+    H, W = igram.shape
+    n_row_tiles, n_col_tiles = ntiles
+    n_total_tiles = n_row_tiles * n_col_tiles
+
+    # Tile overlap size (use 2x window_size for smooth blending)
+    tile_overlap = window_size * 2
+
+    # Compute tile boundaries
+    tiles = _compute_tile_boundaries(H, W, n_row_tiles, n_col_tiles, tile_overlap)
 
     if verbose:
-        print(f"Goldstein filtering on {use_n_gpus} GPUs (IDs: {gpu_ids}) in parallel...")
+        if n_gpus > 1:
+            print(f"Goldstein filtering: {n_total_tiles} tiles ({n_row_tiles}x{n_col_tiles}) on {n_gpus} GPUs...")
+        else:
+            device_name = device if n_gpus == 0 else "cuda"
+            print(f"Goldstein filtering: {n_total_tiles} tiles ({n_row_tiles}x{n_col_tiles}) on {device_name}...")
 
-    # Calculate strip overlap (use window_size for smooth blending)
-    strip_overlap = window_size * 2
+    if n_gpus > 1:
+        # Multi-GPU parallel processing
+        return _filter_tiled_multi_gpu(
+            igram, tiles, alpha, window_size, overlap, patch_batch_size,
+            n_gpus, tile_overlap, verbose
+        )
+    else:
+        # Single-device sequential processing
+        return _filter_tiled_single_device(
+            igram, tiles, alpha, window_size, overlap, patch_batch_size,
+            device, tile_overlap, verbose
+        )
 
-    # Calculate strip boundaries
-    base_strip_height = H // use_n_gpus
-    strips = []
 
-    for i in range(use_n_gpus):
-        # Data region (what this strip is responsible for)
-        data_row_start = i * base_strip_height
-        data_row_end = (i + 1) * base_strip_height if i < use_n_gpus - 1 else H
+def _compute_tile_boundaries(
+    H: int,
+    W: int,
+    n_row_tiles: int,
+    n_col_tiles: int,
+    tile_overlap: int,
+) -> list[dict]:
+    """Compute tile boundaries with overlap."""
+    base_tile_h = H // n_row_tiles
+    base_tile_w = W // n_col_tiles
 
-        # Extended region with overlap
-        row_start = max(0, data_row_start - strip_overlap)
-        row_end = min(H, data_row_end + strip_overlap)
+    tiles = []
 
-        strips.append({
-            'gpu_id': gpu_ids[i],
-            'row_start': row_start,
-            'row_end': row_end,
-            'data_row_start': data_row_start,
-            'data_row_end': data_row_end,
+    for i in range(n_row_tiles):
+        for j in range(n_col_tiles):
+            # Data region (what this tile is responsible for)
+            data_row_start = i * base_tile_h
+            data_row_end = (i + 1) * base_tile_h if i < n_row_tiles - 1 else H
+            data_col_start = j * base_tile_w
+            data_col_end = (j + 1) * base_tile_w if j < n_col_tiles - 1 else W
+
+            # Extended region with overlap
+            row_start = max(0, data_row_start - tile_overlap)
+            row_end = min(H, data_row_end + tile_overlap)
+            col_start = max(0, data_col_start - tile_overlap)
+            col_end = min(W, data_col_end + tile_overlap)
+
+            tiles.append({
+                'row_idx': i,
+                'col_idx': j,
+                'row_start': row_start,
+                'row_end': row_end,
+                'col_start': col_start,
+                'col_end': col_end,
+                'data_row_start': data_row_start,
+                'data_row_end': data_row_end,
+                'data_col_start': data_col_start,
+                'data_col_end': data_col_end,
+            })
+
+    return tiles
+
+
+def _filter_tiled_single_device(
+    igram: np.ndarray,
+    tiles: list[dict],
+    alpha: float,
+    window_size: int,
+    overlap: float,
+    patch_batch_size: int,
+    device: str,
+    tile_overlap: int,
+    verbose: bool,
+) -> np.ndarray:
+    """Process tiles sequentially on a single device."""
+    from rapidphase.device.manager import DeviceManager
+
+    H, W = igram.shape
+    n_tiles = len(tiles)
+
+    # Create device manager and filter
+    dm = DeviceManager(device)
+    filt = GoldsteinFilter(
+        dm,
+        alpha=alpha,
+        window_size=window_size,
+        overlap=overlap,
+        patch_batch_size=patch_batch_size,
+    )
+
+    # Process tiles
+    processed_tiles = []
+
+    for idx, tile in enumerate(tiles):
+        if verbose:
+            print(f"  Tile {idx + 1}/{n_tiles}...")
+
+        # Extract tile data (stays on CPU)
+        tile_data = igram[
+            tile['row_start']:tile['row_end'],
+            tile['col_start']:tile['col_end']
+        ].copy()
+
+        # Process on GPU
+        filtered_tile = filt(tile_data, return_numpy=True)
+
+        # Store result
+        processed_tiles.append({
+            'data': filtered_tile,
+            'info': tile,
         })
 
+        # Clear GPU cache
+        dm.clear_cache()
+
+    if verbose:
+        print("  Merging tiles...")
+
+    # Merge tiles
+    return _merge_tiles(processed_tiles, (H, W))
+
+
+def _filter_tiled_multi_gpu(
+    igram: np.ndarray,
+    tiles: list[dict],
+    alpha: float,
+    window_size: int,
+    overlap: float,
+    patch_batch_size: int,
+    n_gpus: int,
+    tile_overlap: int,
+    verbose: bool,
+) -> np.ndarray:
+    """Process tiles in parallel across multiple GPUs."""
+    import threading
+
+    from rapidphase.device.manager import DeviceManager
+
+    H, W = igram.shape
+    n_tiles = len(tiles)
+    gpu_ids = list(range(n_gpus))
+
+    # Group tiles by GPU (round-robin assignment)
+    tiles_per_gpu: list[list[tuple[int, dict]]] = [[] for _ in range(n_gpus)]
+    for i, tile in enumerate(tiles):
+        tiles_per_gpu[i % n_gpus].append((i, tile))
+
     # Results storage
-    results: list[dict | None] = [None] * use_n_gpus
+    results: list[dict | None] = [None] * n_tiles
 
     # Progress tracking
     progress_lock = threading.Lock()
     completed_count = [0]
 
-    def process_strip(strip_idx: int, strip_info: dict):
-        """Worker function to process a strip on a specific GPU."""
-        gpu_id = strip_info['gpu_id']
-
+    def process_gpu_tiles(gpu_id: int, tile_list: list[tuple[int, dict]]):
+        """Worker function to process tiles on a specific GPU."""
         # Create device manager and filter for this GPU
         dm = DeviceManager(f"cuda:{gpu_id}")
         filt = GoldsteinFilter(
@@ -585,116 +835,118 @@ def filter_multi_gpu(
             patch_batch_size=patch_batch_size,
         )
 
-        # Extract strip data
-        strip_data = igram[strip_info['row_start']:strip_info['row_end'], :].copy()
+        for tile_idx, tile in tile_list:
+            # Extract tile data (stays on CPU)
+            tile_data = igram[
+                tile['row_start']:tile['row_end'],
+                tile['col_start']:tile['col_end']
+            ].copy()
 
-        # Apply filter
-        filtered_strip = filt(strip_data, return_numpy=True)
+            # Process on GPU
+            filtered_tile = filt(tile_data, return_numpy=True)
 
-        # Store result with metadata
-        results[strip_idx] = {
-            'data': filtered_strip,
-            'info': strip_info,
-        }
+            # Store result
+            results[tile_idx] = {
+                'data': filtered_tile,
+                'info': tile,
+            }
+
+            # Update progress
+            with progress_lock:
+                completed_count[0] += 1
+                if verbose:
+                    print(f"  Tile {completed_count[0]}/{n_tiles} (GPU {gpu_id})")
 
         # Clean up GPU memory
         dm.clear_cache()
 
-        # Update progress
-        with progress_lock:
-            completed_count[0] += 1
-            if verbose:
-                print(f"  Strip {completed_count[0]}/{use_n_gpus} complete (GPU {gpu_id})")
-
-    # Process strips in parallel
-    with ThreadPoolExecutor(max_workers=use_n_gpus) as executor:
+    # Process tiles in parallel
+    with ThreadPoolExecutor(max_workers=n_gpus) as executor:
         futures = [
-            executor.submit(process_strip, i, strips[i])
-            for i in range(use_n_gpus)
+            executor.submit(process_gpu_tiles, gpu_ids[i], tiles_per_gpu[i])
+            for i in range(n_gpus)
         ]
         for future in futures:
             future.result()
 
     if verbose:
-        print("Merging strips...")
+        print("  Merging tiles...")
 
-    # Merge strips with smooth blending
-    output = _merge_strips(results, (H, W), strip_overlap)
-
-    if verbose:
-        print("Done.")
-
-    return output
+    # Convert to list and merge
+    processed_tiles = [r for r in results if r is not None]
+    return _merge_tiles(processed_tiles, (H, W))
 
 
-def _merge_strips(
-    results: list[dict],
+def _merge_tiles(
+    processed_tiles: list[dict],
     shape: tuple[int, int],
-    overlap: int,
 ) -> np.ndarray:
     """
-    Merge filtered strips with smooth blending in overlap regions.
+    Merge filtered tiles with smooth blending.
 
-    Parameters
-    ----------
-    results : list of dict
-        List of {'data': filtered_strip, 'info': strip_info} dicts.
-    shape : tuple of int
-        Output image shape (H, W).
-    overlap : int
-        Overlap size in pixels.
-
-    Returns
-    -------
-    np.ndarray
-        Merged filtered image.
+    Uses cosine ramp blending in overlap regions based on DATA boundaries.
     """
     H, W = shape
 
     # Determine output dtype from first result
-    output_dtype = results[0]['data'].dtype
+    output_dtype = processed_tiles[0]['data'].dtype
 
     # Accumulators
     output = np.zeros((H, W), dtype=output_dtype)
     weight_sum = np.zeros((H, W), dtype=np.float64)
 
-    for result in results:
-        strip_data = result['data']
+    for result in processed_tiles:
+        tile_data = result['data']
         info = result['info']
 
-        strip_H = strip_data.shape[0]
+        tile_H, tile_W = tile_data.shape
 
-        # Create blend weights for this strip
-        weights = np.ones(strip_H, dtype=np.float64)
+        # Create 2D blend weights
+        weights = np.ones((tile_H, tile_W), dtype=np.float64)
 
-        # Top overlap region: ramp from 0 to 1
+        # Top overlap region: ramp from 0 at row_start to 1 at data_row_start
         top_overlap = info['data_row_start'] - info['row_start']
         if top_overlap > 0:
             t = np.linspace(0, 1, top_overlap + 1)[1:]
             ramp = 0.5 * (1 - np.cos(t * np.pi))
-            weights[:top_overlap] = ramp
+            weights[:top_overlap, :] *= ramp[:, np.newaxis]
 
-        # Bottom overlap region: ramp from 1 to 0
+        # Bottom overlap region: ramp from 1 at data_row_end to 0 at row_end
         bottom_overlap = info['row_end'] - info['data_row_end']
         if bottom_overlap > 0:
             t = np.linspace(0, 1, bottom_overlap + 1)[1:]
             ramp = 0.5 * (1 - np.cos(t * np.pi))
-            weights[-bottom_overlap:] = ramp[::-1]
+            weights[-bottom_overlap:, :] *= ramp[::-1, np.newaxis]
 
-        # Expand weights to 2D
-        weights_2d = weights[:, np.newaxis] * np.ones((1, W))
+        # Left overlap region: ramp from 0 at col_start to 1 at data_col_start
+        left_overlap = info['data_col_start'] - info['col_start']
+        if left_overlap > 0:
+            t = np.linspace(0, 1, left_overlap + 1)[1:]
+            ramp = 0.5 * (1 - np.cos(t * np.pi))
+            weights[:, :left_overlap] *= ramp[np.newaxis, :]
+
+        # Right overlap region: ramp from 1 at data_col_end to 0 at col_end
+        right_overlap = info['col_end'] - info['data_col_end']
+        if right_overlap > 0:
+            t = np.linspace(0, 1, right_overlap + 1)[1:]
+            ramp = 0.5 * (1 - np.cos(t * np.pi))
+            weights[:, -right_overlap:] *= ramp[::-1][np.newaxis, :]
 
         # Handle NaN values
-        nan_mask = np.isnan(strip_data)
-        effective_weights = weights_2d.copy()
+        nan_mask = np.isnan(tile_data)
+        effective_weights = weights.copy()
         effective_weights[nan_mask] = 0.0
 
-        safe_data = strip_data.copy()
+        safe_data = tile_data.copy()
         safe_data[nan_mask] = 0.0
 
         # Accumulate
-        output[info['row_start']:info['row_end'], :] += effective_weights * safe_data
-        weight_sum[info['row_start']:info['row_end'], :] += effective_weights
+        output[info['row_start']:info['row_end'], info['col_start']:info['col_end']] += (
+            effective_weights * safe_data
+        )
+        weight_sum[info['row_start']:info['row_end'], info['col_start']:info['col_end']] += (
+            effective_weights
+        )
 
     # Normalize by weight sum
     valid_output = weight_sum > 1e-10
