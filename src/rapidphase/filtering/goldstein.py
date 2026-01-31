@@ -11,8 +11,10 @@ Reference:
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 
 if TYPE_CHECKING:
@@ -449,3 +451,254 @@ class GoldsteinFilter:
     def dtype(self) -> torch.dtype:
         """The dtype used for computation."""
         return self.dm.dtype
+
+
+def _get_gpu_count() -> int:
+    """Get number of available GPUs using torch.cuda."""
+    if torch.cuda.is_available():
+        return torch.cuda.device_count()
+    return 0
+
+
+def filter_multi_gpu(
+    igram: np.ndarray,
+    alpha: float = 0.6,
+    window_size: int = 64,
+    overlap: float = 0.75,
+    patch_batch_size: int = 1024,
+    n_gpus: int | None = None,
+    device: str = "auto",
+    verbose: bool = True,
+) -> np.ndarray:
+    """
+    Apply Goldstein filter using multiple GPUs in parallel.
+
+    Splits the image into horizontal strips, processes each strip on a
+    separate GPU, and merges the results with smooth blending.
+
+    Parameters
+    ----------
+    igram : np.ndarray
+        Complex interferogram of shape (H, W).
+    alpha : float
+        Filter strength exponent (default 0.6).
+    window_size : int
+        Size of filtering window in pixels (default 64).
+    overlap : float
+        Fractional overlap between adjacent windows (default 0.75).
+    patch_batch_size : int
+        Number of patches to process at once per GPU (default 1024).
+    n_gpus : int, optional
+        Number of GPUs to use. If None, uses all available GPUs.
+    device : str
+        Fallback device when multi-GPU is not available: "cuda", "mps",
+        "cpu", or "auto" (default).
+    verbose : bool
+        If True, print progress information.
+
+    Returns
+    -------
+    np.ndarray
+        Filtered complex interferogram of same shape.
+    """
+    import threading
+
+    from rapidphase.device.manager import DeviceManager
+
+    H, W = igram.shape
+
+    # Determine number of GPUs to use
+    available_gpus = _get_gpu_count()
+
+    if n_gpus is not None:
+        if n_gpus > available_gpus and available_gpus > 0:
+            import warnings
+            warnings.warn(
+                f"Requested {n_gpus} GPUs but only {available_gpus} detected. "
+                f"Using {available_gpus} GPUs.",
+                UserWarning,
+            )
+        use_n_gpus = min(n_gpus, available_gpus) if available_gpus > 0 else 0
+    else:
+        # n_gpus=None -> use all available GPUs
+        use_n_gpus = available_gpus
+
+    # Fall back to single device if multi-GPU not available
+    if use_n_gpus <= 1:
+        dm = DeviceManager(device)
+        filt = GoldsteinFilter(
+            dm,
+            alpha=alpha,
+            window_size=window_size,
+            overlap=overlap,
+            patch_batch_size=patch_batch_size,
+        )
+        return filt(igram, return_numpy=True)
+
+    gpu_ids = list(range(use_n_gpus))
+
+    if verbose:
+        print(f"Goldstein filtering on {use_n_gpus} GPUs (IDs: {gpu_ids}) in parallel...")
+
+    # Calculate strip overlap (use window_size for smooth blending)
+    strip_overlap = window_size * 2
+
+    # Calculate strip boundaries
+    base_strip_height = H // use_n_gpus
+    strips = []
+
+    for i in range(use_n_gpus):
+        # Data region (what this strip is responsible for)
+        data_row_start = i * base_strip_height
+        data_row_end = (i + 1) * base_strip_height if i < use_n_gpus - 1 else H
+
+        # Extended region with overlap
+        row_start = max(0, data_row_start - strip_overlap)
+        row_end = min(H, data_row_end + strip_overlap)
+
+        strips.append({
+            'gpu_id': gpu_ids[i],
+            'row_start': row_start,
+            'row_end': row_end,
+            'data_row_start': data_row_start,
+            'data_row_end': data_row_end,
+        })
+
+    # Results storage
+    results: list[dict | None] = [None] * use_n_gpus
+
+    # Progress tracking
+    progress_lock = threading.Lock()
+    completed_count = [0]
+
+    def process_strip(strip_idx: int, strip_info: dict):
+        """Worker function to process a strip on a specific GPU."""
+        gpu_id = strip_info['gpu_id']
+
+        # Create device manager and filter for this GPU
+        dm = DeviceManager(f"cuda:{gpu_id}")
+        filt = GoldsteinFilter(
+            dm,
+            alpha=alpha,
+            window_size=window_size,
+            overlap=overlap,
+            patch_batch_size=patch_batch_size,
+        )
+
+        # Extract strip data
+        strip_data = igram[strip_info['row_start']:strip_info['row_end'], :].copy()
+
+        # Apply filter
+        filtered_strip = filt(strip_data, return_numpy=True)
+
+        # Store result with metadata
+        results[strip_idx] = {
+            'data': filtered_strip,
+            'info': strip_info,
+        }
+
+        # Clean up GPU memory
+        dm.clear_cache()
+
+        # Update progress
+        with progress_lock:
+            completed_count[0] += 1
+            if verbose:
+                print(f"  Strip {completed_count[0]}/{use_n_gpus} complete (GPU {gpu_id})")
+
+    # Process strips in parallel
+    with ThreadPoolExecutor(max_workers=use_n_gpus) as executor:
+        futures = [
+            executor.submit(process_strip, i, strips[i])
+            for i in range(use_n_gpus)
+        ]
+        for future in futures:
+            future.result()
+
+    if verbose:
+        print("Merging strips...")
+
+    # Merge strips with smooth blending
+    output = _merge_strips(results, (H, W), strip_overlap)
+
+    if verbose:
+        print("Done.")
+
+    return output
+
+
+def _merge_strips(
+    results: list[dict],
+    shape: tuple[int, int],
+    overlap: int,
+) -> np.ndarray:
+    """
+    Merge filtered strips with smooth blending in overlap regions.
+
+    Parameters
+    ----------
+    results : list of dict
+        List of {'data': filtered_strip, 'info': strip_info} dicts.
+    shape : tuple of int
+        Output image shape (H, W).
+    overlap : int
+        Overlap size in pixels.
+
+    Returns
+    -------
+    np.ndarray
+        Merged filtered image.
+    """
+    H, W = shape
+
+    # Determine output dtype from first result
+    output_dtype = results[0]['data'].dtype
+
+    # Accumulators
+    output = np.zeros((H, W), dtype=output_dtype)
+    weight_sum = np.zeros((H, W), dtype=np.float64)
+
+    for result in results:
+        strip_data = result['data']
+        info = result['info']
+
+        strip_H = strip_data.shape[0]
+
+        # Create blend weights for this strip
+        weights = np.ones(strip_H, dtype=np.float64)
+
+        # Top overlap region: ramp from 0 to 1
+        top_overlap = info['data_row_start'] - info['row_start']
+        if top_overlap > 0:
+            t = np.linspace(0, 1, top_overlap + 1)[1:]
+            ramp = 0.5 * (1 - np.cos(t * np.pi))
+            weights[:top_overlap] = ramp
+
+        # Bottom overlap region: ramp from 1 to 0
+        bottom_overlap = info['row_end'] - info['data_row_end']
+        if bottom_overlap > 0:
+            t = np.linspace(0, 1, bottom_overlap + 1)[1:]
+            ramp = 0.5 * (1 - np.cos(t * np.pi))
+            weights[-bottom_overlap:] = ramp[::-1]
+
+        # Expand weights to 2D
+        weights_2d = weights[:, np.newaxis] * np.ones((1, W))
+
+        # Handle NaN values
+        nan_mask = np.isnan(strip_data)
+        effective_weights = weights_2d.copy()
+        effective_weights[nan_mask] = 0.0
+
+        safe_data = strip_data.copy()
+        safe_data[nan_mask] = 0.0
+
+        # Accumulate
+        output[info['row_start']:info['row_end'], :] += effective_weights * safe_data
+        weight_sum[info['row_start']:info['row_end'], :] += effective_weights
+
+    # Normalize by weight sum
+    valid_output = weight_sum > 1e-10
+    output[valid_output] = output[valid_output] / weight_sum[valid_output]
+    output[~valid_output] = np.nan
+
+    return output

@@ -419,6 +419,8 @@ def goldstein_filter(
     overlap: float = 0.75,
     patch_batch_size: int = 1024,
     device: DeviceType = "auto",
+    n_gpus: int | None = None,
+    verbose: bool = False,
 ) -> np.ndarray:
     """
     Apply Goldstein adaptive filter to reduce interferogram noise.
@@ -451,6 +453,13 @@ def goldstein_filter(
     device : str
         Compute device: "cuda", "mps", "cpu", or "auto" (default).
         "auto" selects best available (CUDA > MPS > CPU).
+        Ignored when n_gpus > 1 (uses CUDA devices directly).
+    n_gpus : int, optional
+        Number of GPUs to use for parallel processing. If None (default),
+        uses single-GPU mode. Set to number of GPUs for multi-GPU parallel
+        processing on large images.
+    verbose : bool
+        If True, print progress information for multi-GPU processing.
 
     Returns
     -------
@@ -474,6 +483,10 @@ def goldstein_filter(
     If you encounter out-of-memory errors, reduce patch_batch_size (e.g., 256
     or 128) rather than switching to CPU.
 
+    When using multiple GPUs (n_gpus > 1), the image is split into horizontal
+    strips and processed in parallel across GPUs, then merged with smooth
+    blending.
+
     Examples
     --------
     Basic filtering before unwrapping:
@@ -490,6 +503,10 @@ def goldstein_filter(
 
     >>> filtered = rapidphase.goldstein_filter(igram, device="cuda")
 
+    Multi-GPU filtering for large images:
+
+    >>> filtered = rapidphase.goldstein_filter(igram, n_gpus=4, verbose=True)
+
     Large image with limited GPU memory:
 
     >>> filtered = rapidphase.goldstein_filter(igram, patch_batch_size=256, device="cuda")
@@ -503,17 +520,18 @@ def goldstein_filter(
     --------
     unwrap : Main phase unwrapping function.
     """
-    # Initialize device manager
-    dm = DeviceManager(device)
+    from rapidphase.filtering.goldstein import filter_multi_gpu
 
-    # Create filter
-    filt = GoldsteinFilter(
-        dm,
+    # Use multi-GPU path for CUDA devices
+    # n_gpus=None -> use all available GPUs
+    # n_gpus=N -> use N GPUs
+    return filter_multi_gpu(
+        igram,
         alpha=alpha,
         window_size=window_size,
         overlap=overlap,
         patch_batch_size=patch_batch_size,
+        n_gpus=n_gpus,
+        device=device,
+        verbose=verbose,
     )
-
-    # Apply filter and return numpy array
-    return filt(igram, return_numpy=True)
