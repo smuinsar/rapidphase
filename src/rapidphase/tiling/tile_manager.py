@@ -7,7 +7,7 @@ GPU processing, then merges results with phase alignment and feathered blending.
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
@@ -20,13 +20,6 @@ try:
     HAS_TQDM = True
 except ImportError:
     HAS_TQDM = False
-
-# Try to import GPUtil for accurate GPU availability detection on HPC
-try:
-    import GPUtil
-    HAS_GPUTIL = True
-except ImportError:
-    HAS_GPUTIL = False
 
 if TYPE_CHECKING:
     from rapidphase.device.manager import DeviceManager
@@ -80,37 +73,18 @@ class TileManager:
         self.ntiles = ntiles
         self.overlap = overlap
 
-    def _get_available_gpu_ids(self) -> list[int]:
+    def _get_gpu_count(self) -> int:
         """
-        Get list of available GPU IDs.
-
-        Uses GPUtil if available (recommended for HPC systems) to detect
-        actually available GPUs. Falls back to torch.cuda.device_count().
+        Get number of available GPUs using torch.cuda.
 
         Returns
         -------
-        list of int
-            List of available GPU device IDs.
+        int
+            Number of available CUDA GPUs (0 if CUDA not available).
         """
-        if not torch.cuda.is_available():
-            return []
-
-        if HAS_GPUTIL:
-            # Use GPUtil to find available GPUs (respects HPC allocations)
-            try:
-                gpu_ids = GPUtil.getAvailable(
-                    order='first',
-                    limit=100,  # Get all available
-                    maxLoad=0.9,  # GPUs with <90% load
-                    maxMemory=0.9,  # GPUs with <90% memory used
-                )
-                if gpu_ids:
-                    return gpu_ids
-            except Exception:
-                pass  # Fall back to torch
-
-        # Fall back to torch - return all visible GPUs
-        return list(range(torch.cuda.device_count()))
+        if torch.cuda.is_available():
+            return torch.cuda.device_count()
+        return 0
 
     def compute_tiles(
         self,
@@ -547,23 +521,24 @@ class TileManager:
         n_tiles = len(tiles)
 
         # Determine number of GPUs to use
-        available_gpu_ids = self._get_available_gpu_ids()
-        available_gpus = len(available_gpu_ids)
+        # Priority: n_gpus parameter > torch.cuda.device_count()
+        available_gpus = self._get_gpu_count()
 
-        if n_gpus is None:
-            use_n_gpus = available_gpus
-            use_gpu_ids = available_gpu_ids
-        else:
-            # Validate user-specified GPU count
+        if n_gpus is not None:
+            # User explicitly specified GPU count - trust it but cap at available
             if n_gpus > available_gpus and available_gpus > 0:
                 import warnings
                 warnings.warn(
-                    f"Requested {n_gpus} GPUs but only {available_gpus} available. "
+                    f"Requested {n_gpus} GPUs but only {available_gpus} detected. "
                     f"Using {available_gpus} GPUs.",
                     UserWarning,
                 )
             use_n_gpus = min(n_gpus, available_gpus) if available_gpus > 0 else 0
-            use_gpu_ids = available_gpu_ids[:use_n_gpus]
+        else:
+            # Auto-detect using torch.cuda
+            use_n_gpus = available_gpus
+
+        use_gpu_ids = list(range(use_n_gpus))
 
         if use_n_gpus > 1 and self.dm.device_type == "cuda":
             # Multi-GPU parallel processing
