@@ -17,6 +17,13 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
+# Try to import tqdm for progress bars
+try:
+    from tqdm.auto import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
+
 if TYPE_CHECKING:
     from rapidphase.device.manager import DeviceManager
 
@@ -807,8 +814,19 @@ def _filter_tiled_single_device(
     # Process tiles
     processed_tiles = []
 
-    for idx, tile in enumerate(tiles):
-        if verbose:
+    # Set up progress iteration
+    if verbose and HAS_TQDM:
+        tile_iter = tqdm(
+            enumerate(tiles),
+            total=n_tiles,
+            desc=f"Filtering tiles ({n_tiles})",
+            unit="tile",
+        )
+    else:
+        tile_iter = enumerate(tiles)
+
+    for idx, tile in tile_iter:
+        if verbose and not HAS_TQDM:
             print(f"  Tile {idx + 1}/{n_tiles}...")
 
         # Extract tile data (stays on CPU)
@@ -829,7 +847,7 @@ def _filter_tiled_single_device(
         # Clear GPU cache
         dm.clear_cache()
 
-    if verbose:
+    if verbose and not HAS_TQDM:
         print("  Merging tiles...")
 
     # Merge tiles
@@ -868,6 +886,15 @@ def _filter_tiled_multi_gpu(
     progress_lock = threading.Lock()
     completed_count = [0]
 
+    # Create tqdm progress bar if available
+    pbar = None
+    if verbose and HAS_TQDM:
+        pbar = tqdm(
+            total=n_tiles,
+            desc=f"Filtering ({n_gpus} GPUs)",
+            unit="tile",
+        )
+
     def process_gpu_tiles(gpu_id: int, tile_list: list[tuple[int, dict]]):
         """Worker function to process tiles on a specific GPU."""
         # Create device manager and filter for this GPU
@@ -899,7 +926,9 @@ def _filter_tiled_multi_gpu(
             # Update progress
             with progress_lock:
                 completed_count[0] += 1
-                if verbose:
+                if pbar is not None:
+                    pbar.update(1)
+                elif verbose:
                     print(f"  Tile {completed_count[0]}/{n_tiles} (GPU {gpu_id})")
 
         # Clean up GPU memory
@@ -914,7 +943,10 @@ def _filter_tiled_multi_gpu(
         for future in futures:
             future.result()
 
-    if verbose:
+    if pbar is not None:
+        pbar.close()
+
+    if verbose and not HAS_TQDM:
         print("  Merging tiles...")
 
     # Convert to list and merge
