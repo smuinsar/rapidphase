@@ -13,7 +13,7 @@ from typing import Literal
 import numpy as np
 import torch
 
-DeviceType = Literal["cpu", "cuda", "mps", "auto"]
+DeviceType = Literal["cpu", "cuda", "mps", "auto"] | str  # Also supports "cuda:0", "cuda:1", etc.
 
 
 @dataclass
@@ -68,6 +68,14 @@ class DeviceManager:
             if not torch.cuda.is_available():
                 raise RuntimeError("CUDA requested but not available")
             return torch.device("cuda")
+        elif isinstance(device, str) and device.startswith("cuda:"):
+            # Handle specific CUDA device like "cuda:0", "cuda:1"
+            if not torch.cuda.is_available():
+                raise RuntimeError("CUDA requested but not available")
+            gpu_id = int(device.split(":")[1])
+            if gpu_id >= torch.cuda.device_count():
+                raise RuntimeError(f"CUDA device {gpu_id} not available (only {torch.cuda.device_count()} GPUs)")
+            return torch.device(device)
         elif device == "mps":
             if not torch.backends.mps.is_available():
                 raise RuntimeError("MPS requested but not available")

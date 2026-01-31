@@ -166,12 +166,32 @@ def unwrap(
 
         tile_manager = TileManager(dm, ntiles=ntiles, overlap=tile_overlap)
 
-        def process_tile(tile_phase, tile_coh=None, tile_nan_mask=None):
-            return unwrapper.unwrap(tile_phase, tile_coh, nan_mask=tile_nan_mask)
+        # Create unwrapper factory for multi-GPU support
+        def create_unwrapper_for_device(device_manager):
+            if algorithm == "dct":
+                return DCTUnwrapper(device_manager)
+            elif algorithm == "irls":
+                return IRLSUnwrapper(
+                    device_manager,
+                    max_iterations=max_iterations,
+                    tolerance=tolerance,
+                    nlooks=nlooks,
+                )
+            else:  # irls_cg
+                return IRLSCGUnwrapper(
+                    device_manager,
+                    max_irls_iterations=max_iterations,
+                    irls_tolerance=tolerance,
+                    nlooks=nlooks,
+                )
 
         # Use numpy-based tiling to avoid loading entire image to GPU
         unw = tile_manager.process_tiled_numpy(
-            phase, process_tile, coherence, nan_mask, verbose=True
+            phase,
+            unwrapper_factory=create_unwrapper_for_device,
+            coherence=coherence,
+            nan_mask=nan_mask,
+            verbose=True,
         )
     else:
         # Standard path: convert entire image to GPU tensors

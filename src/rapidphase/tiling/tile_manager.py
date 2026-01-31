@@ -7,6 +7,7 @@ GPU processing, then merges results with phase alignment and feathered blending.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
@@ -465,7 +466,7 @@ class TileManager:
     def process_tiled_numpy(
         self,
         image: np.ndarray,
-        process_fn: Callable[[torch.Tensor, torch.Tensor | None, torch.Tensor | None], torch.Tensor],
+        unwrapper_factory: Callable,
         coherence: np.ndarray | None = None,
         nan_mask: np.ndarray | None = None,
         verbose: bool = True,
@@ -477,13 +478,15 @@ class TileManager:
         transfers individual tiles to GPU for processing. This enables processing
         of images much larger than GPU memory.
 
+        Automatically uses all available CUDA GPUs for parallel processing.
+
         Parameters
         ----------
         image : np.ndarray
             Input image of shape (H, W) as numpy array.
-        process_fn : callable
-            Function to apply to each tile.
-            Should take (tile_tensor, coherence_tile, nan_mask_tile) and return processed tile tensor.
+        unwrapper_factory : callable
+            Factory function that takes a DeviceManager and returns an unwrapper.
+            This allows creating device-specific unwrappers for multi-GPU processing.
         coherence : np.ndarray, optional
             Coherence map of shape (H, W) as numpy array.
         nan_mask : np.ndarray, optional
@@ -499,6 +502,36 @@ class TileManager:
         H, W = image.shape
         tiles = self.compute_tiles((H, W))
         n_tiles = len(tiles)
+
+        # Check for multi-GPU availability
+        n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+
+        if n_gpus > 1 and self.dm.device_type == "cuda":
+            # Multi-GPU parallel processing
+            return self._process_tiled_multi_gpu(
+                image, unwrapper_factory, coherence, nan_mask, tiles, n_gpus, verbose
+            )
+        else:
+            # Single device processing
+            return self._process_tiled_single_device(
+                image, unwrapper_factory, coherence, nan_mask, tiles, verbose
+            )
+
+    def _process_tiled_single_device(
+        self,
+        image: np.ndarray,
+        unwrapper_factory: Callable,
+        coherence: np.ndarray | None,
+        nan_mask: np.ndarray | None,
+        tiles: list[TileInfo],
+        verbose: bool,
+    ) -> np.ndarray:
+        """Single-device tile processing."""
+        H, W = image.shape
+        n_tiles = len(tiles)
+
+        # Create unwrapper for this device
+        unwrapper = unwrapper_factory(self.dm)
 
         # Store processed tiles as numpy arrays (CPU memory)
         processed_tiles_np: list[tuple[TileInfo, np.ndarray]] = []
@@ -542,7 +575,7 @@ class TileManager:
                 nan_mask_tile_t = self.dm.to_tensor(nan_mask_tile_np.astype(np.float32)) > 0.5
 
             # Process tile on GPU
-            result_t = process_fn(tile_data_t, coh_tile_t, nan_mask_tile_t)
+            result_t = unwrapper.unwrap(tile_data_t, coh_tile_t, nan_mask=nan_mask_tile_t)
 
             # Move result back to CPU numpy and store
             result_np = self.dm.to_numpy(result_t)
@@ -559,6 +592,122 @@ class TileManager:
 
         # Merge results with phase alignment (entirely on CPU using numpy)
         result = self._merge_tiles_numpy(processed_tiles_np, (H, W), verbose=verbose)
+
+        if verbose and not HAS_TQDM:
+            print("  Done.")
+
+        return result
+
+    def _process_tiled_multi_gpu(
+        self,
+        image: np.ndarray,
+        unwrapper_factory: Callable,
+        coherence: np.ndarray | None,
+        nan_mask: np.ndarray | None,
+        tiles: list[TileInfo],
+        n_gpus: int,
+        verbose: bool,
+    ) -> np.ndarray:
+        """Multi-GPU parallel tile processing."""
+        from rapidphase.device.manager import DeviceManager
+        import threading
+
+        H, W = image.shape
+        n_tiles = len(tiles)
+
+        if verbose:
+            print(f"Processing {n_tiles} tiles on {n_gpus} GPUs in parallel...")
+
+        # Group tiles by GPU (round-robin assignment)
+        tiles_per_gpu: list[list[tuple[int, TileInfo]]] = [[] for _ in range(n_gpus)]
+        for i, tile in enumerate(tiles):
+            tiles_per_gpu[i % n_gpus].append((i, tile))
+
+        # Results storage (thread-safe via list index assignment)
+        results: list[tuple[TileInfo, np.ndarray] | None] = [None] * n_tiles
+
+        # Progress tracking
+        progress_lock = threading.Lock()
+        completed_count = [0]  # Use list to allow modification in nested function
+
+        # Progress bar for tqdm
+        pbar = None
+        if verbose and HAS_TQDM:
+            pbar = tqdm(
+                total=n_tiles,
+                desc=f"Unwrapping ({self.ntiles[0]}x{self.ntiles[1]} tiles, {n_gpus} GPUs)",
+                unit="tile",
+            )
+
+        def process_gpu_tiles(gpu_id: int, tile_list: list[tuple[int, TileInfo]]):
+            """Worker function to process all tiles assigned to a specific GPU."""
+            # Create device manager and unwrapper for this GPU
+            dm = DeviceManager(f"cuda:{gpu_id}")
+            unwrapper = unwrapper_factory(dm)
+
+            for tile_idx, tile in tile_list:
+                # Extract tile data
+                tile_data_np = image[tile.row_start:tile.row_end, tile.col_start:tile.col_end].copy()
+
+                coh_tile_np = None
+                if coherence is not None:
+                    coh_tile_np = coherence[tile.row_start:tile.row_end, tile.col_start:tile.col_end].copy()
+
+                nan_mask_tile_np = None
+                if nan_mask is not None:
+                    nan_mask_tile_np = nan_mask[tile.row_start:tile.row_end, tile.col_start:tile.col_end].copy()
+
+                # Convert to tensors on this GPU
+                tile_data_t = dm.to_tensor(tile_data_np)
+                coh_tile_t = dm.to_tensor(coh_tile_np) if coh_tile_np is not None else None
+                nan_mask_tile_t = None
+                if nan_mask_tile_np is not None:
+                    nan_mask_tile_t = dm.to_tensor(nan_mask_tile_np.astype(np.float32)) > 0.5
+
+                # Process tile using the GPU-specific unwrapper
+                result_t = unwrapper.unwrap(tile_data_t, coh_tile_t, nan_mask=nan_mask_tile_t)
+
+                # Move result back to CPU
+                result_np = dm.to_numpy(result_t)
+
+                # Store result
+                results[tile_idx] = (tile, result_np)
+
+                # Clean up GPU memory
+                del tile_data_t, coh_tile_t, nan_mask_tile_t, result_t
+
+                # Update progress
+                with progress_lock:
+                    completed_count[0] += 1
+                    if pbar is not None:
+                        pbar.update(1)
+                    elif verbose and (completed_count[0] % max(1, n_tiles // 10) == 0 or completed_count[0] == n_tiles):
+                        print(f"  Tile {completed_count[0]}/{n_tiles} ({100 * completed_count[0] // n_tiles}%)")
+
+            # Final cache clear for this GPU
+            dm.clear_cache()
+
+        # Process tiles in parallel - one thread per GPU
+        with ThreadPoolExecutor(max_workers=n_gpus) as executor:
+            futures = [
+                executor.submit(process_gpu_tiles, gpu_id, tiles_per_gpu[gpu_id])
+                for gpu_id in range(n_gpus)
+            ]
+            # Wait for all to complete
+            for future in futures:
+                future.result()
+
+        if pbar is not None:
+            pbar.close()
+
+        # Convert to list of tuples
+        processed_tiles_np = [r for r in results if r is not None]
+
+        if verbose:
+            print("Aligning tile phases...")
+
+        # Merge results
+        result = self._merge_tiles_numpy(processed_tiles_np, (H, W), verbose=False)
 
         if verbose and not HAS_TQDM:
             print("  Done.")
