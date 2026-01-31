@@ -141,11 +141,11 @@ class GoldsteinFilter:
 
         return smoothed
 
-    def _extract_patches(
+    def _extract_patches_unfold(
         self, data: torch.Tensor, step: int
-    ) -> tuple[torch.Tensor, list[tuple[int, int]]]:
+    ) -> tuple[torch.Tensor, int, int]:
         """
-        Extract overlapping patches from the input.
+        Extract overlapping patches using efficient unfold operation.
 
         Parameters
         ----------
@@ -158,27 +158,31 @@ class GoldsteinFilter:
         -------
         patches : torch.Tensor
             Extracted patches of shape (N, window_size, window_size).
-        positions : list of tuple
-            (row, col) position of each patch's top-left corner.
+        n_rows : int
+            Number of patch rows.
+        n_cols : int
+            Number of patch columns.
         """
         H, W = data.shape
         ws = self.window_size
-        patches = []
-        positions = []
 
-        for i in range(0, H - ws + 1, step):
-            for j in range(0, W - ws + 1, step):
-                patch = data[i : i + ws, j : j + ws]
-                patches.append(patch)
-                positions.append((i, j))
-
-        if not patches:
+        # Check if image is smaller than window
+        if H < ws or W < ws:
             # Image smaller than window - pad and process as single patch
             padded = torch.zeros(ws, ws, dtype=data.dtype, device=data.device)
             padded[:H, :W] = data
-            return padded.unsqueeze(0), [(0, 0)]
+            return padded.unsqueeze(0), 1, 1
 
-        return torch.stack(patches), positions
+        # Use unfold for efficient patch extraction
+        # unfold(dimension, size, step) extracts patches along that dimension
+        # Result shape: (H - ws) // step + 1, (W - ws) // step + 1, ws, ws
+        patches = data.unfold(0, ws, step).unfold(1, ws, step)
+        n_rows, n_cols = patches.shape[0], patches.shape[1]
+
+        # Reshape to (N, ws, ws) where N = n_rows * n_cols
+        patches = patches.contiguous().view(-1, ws, ws)
+
+        return patches, n_rows, n_cols
 
     def _filter_patches_batched(
         self,
@@ -361,23 +365,22 @@ class GoldsteinFilter:
             ).squeeze(0).squeeze(0) > 0.5
 
         pH, pW = padded_data.shape
+        ws = self.window_size
 
-        # Extract patches
-        patches, positions = self._extract_patches(padded_data, step)
-        mask_patches, _ = self._extract_patches(padded_mask.to(self.dm.dtype), step)
+        # Extract patches using efficient unfold operation
+        patches, n_patch_rows, n_patch_cols = self._extract_patches_unfold(padded_data, step)
+        mask_patches, _, _ = self._extract_patches_unfold(padded_mask.to(self.dm.dtype), step)
         mask_patches = mask_patches > 0.5  # Convert back to bool
 
-        # Determine complex dtype for output
-        complex_dtype = torch.complex64 if self.dm.dtype == torch.float32 else torch.complex128
-
-        # Initialize output accumulators
-        output = torch.zeros(pH, pW, dtype=complex_dtype, device=self.dm.device)
-        weights = torch.zeros(pH, pW, dtype=self.dm.dtype, device=self.dm.device)
-
-        window_2d = self._window_2d.to(complex_dtype)
-        num_patches = len(positions)
+        num_patches = patches.shape[0]
 
         # Process patches in batches to manage GPU memory
+        # Collect all filtered patches
+        all_filtered = []
+        all_weights = []
+
+        window_2d_complex = self._window_2d.to(complex_dtype)
+
         for batch_start in range(0, num_patches, self.patch_batch_size):
             batch_end = min(batch_start + self.patch_batch_size, num_patches)
 
@@ -388,26 +391,68 @@ class GoldsteinFilter:
             # Filter this batch
             filtered_batch = self._filter_patches_batched(batch_patches, batch_masks)
 
-            # Accumulate weighted patches from this batch
-            for local_idx, global_idx in enumerate(range(batch_start, batch_end)):
-                i, j = positions[global_idx]
+            # Apply window weighting (vectorized for whole batch)
+            weighted_batch = filtered_batch * window_2d_complex.unsqueeze(0)
 
-                # Apply window weighting
-                weighted_patch = filtered_batch[local_idx] * window_2d
-                weight_patch = self._window_2d * (~batch_masks[local_idx]).to(self.dm.dtype)
+            # Compute weight patches (vectorized)
+            # Weight is window * valid_mask
+            valid_masks = (~batch_masks).to(self.dm.dtype)  # (B, ws, ws)
+            weight_batch = self._window_2d.unsqueeze(0) * valid_masks  # (B, ws, ws)
 
-                # Accumulate
-                output[i : i + self.window_size, j : j + self.window_size] += weighted_patch
-                weights[i : i + self.window_size, j : j + self.window_size] += weight_patch
+            all_filtered.append(weighted_batch)
+            all_weights.append(weight_batch)
 
-            # Free memory from this batch
+            # Free intermediate memory
             del filtered_batch, batch_patches, batch_masks
-            if self.dm.device.type == 'cuda':
-                torch.cuda.empty_cache()
+
+        # Concatenate all batches
+        all_filtered = torch.cat(all_filtered, dim=0)  # (N, ws, ws)
+        all_weights = torch.cat(all_weights, dim=0)  # (N, ws, ws)
+
+        # Use fold to efficiently accumulate patches
+        # fold expects input of shape (batch, C * kernel_h * kernel_w, L)
+        # where L is the number of patches
+        # Output shape is (batch, C, H, W)
+
+        # Reshape filtered patches for fold: (N, ws, ws) -> (1, ws*ws, N)
+        # Handle complex by separating real and imaginary parts
+        filtered_real = all_filtered.real.reshape(num_patches, -1).T.unsqueeze(0)  # (1, ws*ws, N)
+        filtered_imag = all_filtered.imag.reshape(num_patches, -1).T.unsqueeze(0)  # (1, ws*ws, N)
+        weights_flat = all_weights.reshape(num_patches, -1).T.unsqueeze(0)  # (1, ws*ws, N)
+
+        # Use fold to accumulate (this sums overlapping regions automatically)
+        output_real = torch.nn.functional.fold(
+            filtered_real,
+            output_size=(pH, pW),
+            kernel_size=ws,
+            stride=step
+        ).squeeze(0).squeeze(0)
+
+        output_imag = torch.nn.functional.fold(
+            filtered_imag,
+            output_size=(pH, pW),
+            kernel_size=ws,
+            stride=step
+        ).squeeze(0).squeeze(0)
+
+        weights_sum = torch.nn.functional.fold(
+            weights_flat,
+            output_size=(pH, pW),
+            kernel_size=ws,
+            stride=step
+        ).squeeze(0).squeeze(0)
+
+        # Combine real and imaginary parts
+        output = torch.complex(output_real, output_imag)
+
+        # Free memory
+        del all_filtered, all_weights, filtered_real, filtered_imag, weights_flat
+        if self.dm.device.type == 'cuda':
+            torch.cuda.empty_cache()
 
         # Normalize by weights
-        valid_weights = weights > 1e-10
-        output[valid_weights] = output[valid_weights] / weights[valid_weights]
+        valid_weights = weights_sum > 1e-10
+        output[valid_weights] = output[valid_weights] / weights_sum[valid_weights]
 
         # Crop to original size (accounting for reflection padding offset)
         output = output[pad_size:pad_size + H, pad_size:pad_size + W]
