@@ -27,6 +27,8 @@ Processing a NISAR interferogram showing wrapped phase and the unwrapped result:
 
 ![NISAR Unwrapping Example](images/NISAR_unwrap.png)
 
+<a href="images/NISAR_interferogram_map.html" target="_blank">View Interactive Interferogram Map</a>
+
 ### OPERA CSLC Algorithm Comparison
 
 Comparison of DCT, IRLS, and IRLS-CG algorithms on OPERA CSLC data:
