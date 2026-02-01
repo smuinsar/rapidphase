@@ -23,7 +23,7 @@ RapidPhase provides fast phase unwrapping algorithms optimized for GPU execution
 
 ### NISAR Interferogram Unwrapping
 
-Processing a NISAR interferogram showing wrapped phase, coherence, and the unwrapped result:
+Processing a NISAR interferogram showing wrapped phase and the unwrapped result:
 
 ![NISAR Unwrapping Example](images/NISAR_unwrap.png)
 
