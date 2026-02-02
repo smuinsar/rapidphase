@@ -58,6 +58,8 @@ Processing a NISAR interferogram showing wrapped phase and the unwrapped result:
 
 ![NISAR Unwrapping Example](images/NISAR_unwrap.png)
 
+<a href="https://raw.githack.com/smuinsar/rapidphase/main/images/NISAR_interferogram_map.html" target="_blank">View Interactive Map: NISAR Wrapped and Unwrapped Interferogram</a>
+
 ### OPERA CSLC Algorithm Comparison
 
 Comparison of DCT, IRLS, and IRLS-CG algorithms on OPERA CSLC data:
@@ -249,3 +251,7 @@ If you use RapidPhase in your research, please cite:
 - The IRLS-CG algorithm is based on [Dubois-Taine et al. (2024)](https://doi.org/10.48550/arXiv.2401.09961)
 - Algorithm implementations inspired by [SNAPHU](https://web.stanford.edu/group/radar/softwareandlinks/sw/snaphu/) and related literature
 - Built with [PyTorch](https://pytorch.org/) for GPU acceleration
+
+## Author
+
+**Jinwoo Kim**: [jinwook@smu.edu](mailto:jinwook@smu.edu)
