@@ -144,7 +144,7 @@ See the [examples/phase_unwrapping_examples.ipynb](examples/phase_unwrapping_exa
 4. Complex interferogram patterns
 5. Noisy data handling
 6. Comparison with SNAPHU
-7. Real NISAR interferogram processing
+7. NISAR interferogram processing
 
 ## Performance
 
