@@ -220,3 +220,7 @@ If you use RapidPhase in your research, please cite:
 - The IRLS-CG algorithm is based on [Dubois-Taine et al. (2024)](https://doi.org/10.48550/arXiv.2401.09961)
 - Algorithm implementations inspired by [SNAPHU](https://web.stanford.edu/group/radar/softwareandlinks/sw/snaphu/) and related literature
 - Built with [PyTorch](https://pytorch.org/) for GPU acceleration
+
+## Author
+
+**Jinwoo Kim**: [jinwook@smu.edu](mailto:jinwook@smu.edu)
