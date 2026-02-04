@@ -131,7 +131,8 @@ igram_filtered = rapidphase.goldstein_filter(
 igram_filtered = rapidphase.goldstein_filter(
     igram_large,
     alpha=0.5,
-    ntiles=(4, 4),          # Split into tiles for processing
+    window_size=64,   
+    ntiles=(12, 12),          # Split into tiles for processing
     patch_batch_size=128,   # Number of patches per batch (reduce if OOM)
     device="cuda",
 )
