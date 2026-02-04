@@ -17,6 +17,7 @@ RapidPhase provides fast phase unwrapping algorithms optimized for GPU execution
   - **IRLS**: Iteratively Reweighted Least Squares with coherence weighting
   - **IRLS-CG**: Conjugate Gradient solver with L1-norm approximation
 - **Tiled Processing**: Handle large interferograms with automatic tile merging
+- **Goldstein Filter**: Adaptive frequency-domain filter for noise reduction before unwrapping
 - **snaphu-py Compatible**: Drop-in replacement API for easy migration
 
 ## Example Results
@@ -114,6 +115,22 @@ unw, conncomp = rapidphase.unwrap_irls(igram, corr, nlooks=5.0)
 unw, conncomp = rapidphase.unwrap_irls_cg(igram, corr, nlooks=5.0)
 ```
 
+### Goldstein Adaptive Filter
+
+```python
+# Apply Goldstein filter to reduce noise before unwrapping
+igram_filtered = rapidphase.goldstein_filter(
+    igram,              # Complex interferogram
+    alpha=0.6,          # Filter strength (0.2-1.0, higher = stronger)
+    window_size=64,     # FFT window size in pixels
+    overlap=0.75,       # Window overlap fraction
+    device="auto",      # "cuda", "mps", "cpu", or "auto"
+)
+
+# Then unwrap the filtered interferogram
+unw, conncomp = rapidphase.unwrap(igram_filtered, corr, nlooks=5.0)
+```
+
 ### Tiled Processing for Large Images
 
 ```python
@@ -143,8 +160,9 @@ See the [examples/phase_unwrapping_examples.ipynb](examples/phase_unwrapping_exa
 3. DCT vs IRLS algorithm comparison
 4. Complex interferogram patterns
 5. Noisy data handling
-6. Comparison with SNAPHU
-7. NISAR interferogram processing
+6. Goldstein adaptive filtering for noise reduction
+7. Comparison with SNAPHU
+8. NISAR interferogram processing
 
 ## Performance
 
