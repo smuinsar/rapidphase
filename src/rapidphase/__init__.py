@@ -12,6 +12,7 @@ from rapidphase.api import (
     unwrap_irls_cg,
     get_available_devices,
     goldstein_filter,
+    clear_gpu_cache,
 )
 from rapidphase.device.manager import DeviceManager
 from rapidphase.filtering.goldstein import GoldsteinFilter
@@ -24,6 +25,7 @@ __all__ = [
     "unwrap_irls_cg",
     "get_available_devices",
     "goldstein_filter",
+    "clear_gpu_cache",
     "DeviceManager",
     "GoldsteinFilter",
 ]

@@ -21,6 +21,70 @@ from rapidphase.tiling.tile_manager import TileManager
 AlgorithmType = Literal["dct", "irls", "irls_cg", "auto"]
 
 
+def clear_gpu_cache(include_cupy: bool = True) -> None:
+    """
+    Clear GPU memory caches for PyTorch and optionally CuPy.
+
+    This function is essential when using rapidphase alongside other GPU
+    frameworks like CuPy. PyTorch and CuPy maintain separate memory pools,
+    which can lead to out-of-memory errors when both are used together.
+
+    Call this function:
+    - After rapidphase operations, before using CuPy
+    - After CuPy operations, before using rapidphase
+    - When encountering unexpected GPU OOM errors
+
+    Parameters
+    ----------
+    include_cupy : bool
+        If True (default), also clear CuPy's memory pools if CuPy is installed.
+        Set to False to only clear PyTorch cache.
+
+    Examples
+    --------
+    Using rapidphase with CuPy in the same workflow:
+
+    >>> import rapidphase
+    >>> import cupy as cp
+    >>>
+    >>> # Run rapidphase operations
+    >>> unw, _ = rapidphase.unwrap(igram, corr)
+    >>>
+    >>> # Clear cache before CuPy operations
+    >>> rapidphase.clear_gpu_cache()
+    >>>
+    >>> # Now CuPy can use the freed GPU memory
+    >>> result = cp.some_operation(data)
+
+    Or use the release_memory parameter in unwrap/goldstein_filter:
+
+    >>> unw, _ = rapidphase.unwrap(igram, corr, release_memory=True)
+    >>> # GPU cache is automatically cleared after unwrapping
+    """
+    import torch
+
+    # Clear PyTorch CUDA cache
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+    # Clear PyTorch MPS cache (Apple Silicon)
+    if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        if hasattr(torch.mps, 'synchronize'):
+            torch.mps.synchronize()
+        if hasattr(torch.mps, 'empty_cache'):
+            torch.mps.empty_cache()
+
+    # Clear CuPy cache if requested and available
+    if include_cupy:
+        try:
+            import cupy as cp
+            cp.get_default_memory_pool().free_all_blocks()
+            cp.get_default_pinned_memory_pool().free_all_blocks()
+        except ImportError:
+            pass  # CuPy not installed, skip
+
+
 def unwrap(
     igram: np.ndarray,
     corr: np.ndarray | None = None,
@@ -32,6 +96,7 @@ def unwrap(
     n_gpus: int | None = None,
     max_iterations: int = 50,
     tolerance: float = 1e-4,
+    release_memory: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Unwrap interferometric phase using GPU-accelerated algorithms.
@@ -74,6 +139,11 @@ def unwrap(
         Maximum IRLS iterations (default 50, only for algorithm="irls").
     tolerance : float
         IRLS convergence tolerance (default 1e-4).
+    release_memory : bool
+        If True, clear GPU memory cache after processing (default False).
+        This is useful when using rapidphase alongside other GPU frameworks
+        like CuPy that maintain separate memory pools. Clearing the cache
+        prevents out-of-memory errors when switching between frameworks.
 
     Returns
     -------
@@ -214,6 +284,10 @@ def unwrap(
     # Mark NaN regions as component 0 (invalid), valid regions as 1
     conncomp = np.ones(unw.shape, dtype=np.int32)
     conncomp[nan_mask] = 0
+
+    # Release GPU memory if requested (helps when using with CuPy)
+    if release_memory:
+        clear_gpu_cache(include_cupy=False)
 
     return unw, conncomp
 
@@ -422,6 +496,7 @@ def goldstein_filter(
     n_gpus: int | None = None,
     ntiles: tuple[int, int] | str = "auto",
     verbose: bool = False,
+    release_memory: bool = False,
 ) -> np.ndarray:
     """
     Apply Goldstein adaptive filter to reduce interferogram noise.
@@ -465,6 +540,11 @@ def goldstein_filter(
         more tiles to fit in GPU memory.
     verbose : bool
         If True, print progress information.
+    release_memory : bool
+        If True, clear GPU memory cache after processing (default False).
+        This is useful when using rapidphase alongside other GPU frameworks
+        like CuPy that maintain separate memory pools. Clearing the cache
+        prevents out-of-memory errors when switching between frameworks.
 
     Returns
     -------
@@ -535,7 +615,7 @@ def goldstein_filter(
     # n_gpus=None -> use all available GPUs
     # n_gpus=N -> use N GPUs
     # ntiles="auto" -> automatically determine tile count based on image/GPU size
-    return filter_multi_gpu(
+    result = filter_multi_gpu(
         igram,
         alpha=alpha,
         window_size=window_size,
@@ -546,3 +626,9 @@ def goldstein_filter(
         ntiles=ntiles,
         verbose=verbose,
     )
+
+    # Release GPU memory if requested (helps when using with CuPy)
+    if release_memory:
+        clear_gpu_cache(include_cupy=False)
+
+    return result
