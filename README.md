@@ -127,6 +127,15 @@ igram_filtered = rapidphase.goldstein_filter(
     device="auto",      # "cuda", "mps", "cpu", or "auto"
 )
 
+# For large images, use ntiles and patch_batch_size to manage memory
+igram_filtered = rapidphase.goldstein_filter(
+    igram_large,
+    alpha=0.5,
+    ntiles=(4, 4),          # Split into tiles for processing
+    patch_batch_size=128,   # Number of patches per batch (reduce if OOM)
+    device="cuda",
+)
+
 # Then unwrap the filtered interferogram
 unw, conncomp = rapidphase.unwrap(igram_filtered, corr, nlooks=5.0)
 ```
