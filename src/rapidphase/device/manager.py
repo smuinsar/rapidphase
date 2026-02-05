@@ -96,10 +96,11 @@ class DeviceManager:
 
     def _get_default_dtype(self) -> torch.dtype:
         """Get the default dtype for the current device."""
-        # MPS has limited float64 support, use float32
-        if self._device.type == "mps":
+        # GPU devices use float32 - sufficient precision for InSAR
+        # processing and halves GPU memory compared to float64
+        if self._device.type in ("cuda", "mps"):
             return torch.float32
-        # CUDA and CPU can use float64 for better precision
+        # CPU can use float64 for better precision
         return torch.float64
 
     @property
@@ -148,7 +149,8 @@ class DeviceManager:
                 else:
                     tensor = torch.from_numpy(data.astype(np.complex128))
             else:
-                tensor = torch.from_numpy(data.astype(np.float64))
+                np_dtype = np.float32 if dtype == torch.float32 else np.float64
+                tensor = torch.from_numpy(data.astype(np_dtype))
                 tensor = tensor.to(dtype)
         else:
             tensor = data.to(dtype)
