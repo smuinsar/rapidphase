@@ -28,7 +28,7 @@ Processing a NISAR interferogram showing wrapped phase and the unwrapped result:
 
 ![NISAR Unwrapping Example](images/NISAR_unwrap.png)
 
-<a href="https://raw.githack.com/smuinsar/rapidphase/main/images/NISAR_interferogram_map.html" target="_blank">View Interactive Map: NISAR Wrapped and Unwrapped Interferogram</a>
+<a href="https://raw.githack.com/smuinsar/rapidphase/main/images/NISAR_erta_ale_volcano_interferogram.html" target="_blank">View Interactive Map: NISAR Wrapped and Unwrapped Interferogram</a>
 
 ### OPERA CSLC Algorithm Comparison
 
