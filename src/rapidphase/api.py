@@ -96,7 +96,7 @@ def unwrap(
     n_gpus: int | None = None,
     max_iterations: int = 50,
     tolerance: float = 1e-4,
-    release_memory: bool = False,
+    release_memory: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Unwrap interferometric phase using GPU-accelerated algorithms.
@@ -496,7 +496,7 @@ def goldstein_filter(
     n_gpus: int | None = None,
     ntiles: tuple[int, int] | str = "auto",
     verbose: bool = False,
-    release_memory: bool = False,
+    release_memory: bool = True,
 ) -> np.ndarray:
     """
     Apply Goldstein adaptive filter to reduce interferogram noise.
