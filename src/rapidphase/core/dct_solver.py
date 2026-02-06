@@ -11,7 +11,7 @@ The algorithm:
 3. Solve Poisson equation by division (embarrassingly parallel)
 4. Transform back using inverse DCT
 
-All operations are GPU-parallelizable via PyTorch.
+All operations are GPU-parallelizable via PyTorch FFT.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ from rapidphase.utils.phase_ops import laplacian
 if TYPE_CHECKING:
     from rapidphase.device.manager import DeviceManager
 
-# Try to import scipy for optimized DCT
+# Try to import scipy for CPU-optimized DCT
 try:
     from scipy.fft import dctn, idctn
     HAS_SCIPY = True
@@ -115,7 +115,7 @@ class DCTUnwrapper(BaseUnwrapper):
         # Pass NaN mask to properly handle invalid pixels
         rho = laplacian(phase_clean, nan_mask=nan_mask)
 
-        # Step 2: 2D DCT (use scipy for accuracy, PyTorch for GPU ops)
+        # Step 2: 2D DCT
         rho_dct = self._dct2(rho)
 
         # Step 3: Get eigenvalues for Poisson solve
@@ -185,12 +185,17 @@ class DCTUnwrapper(BaseUnwrapper):
 
         return self._eigenvalue_cache[key]
 
+    @property
+    def _use_scipy(self) -> bool:
+        """Use scipy DCT only on CPU devices (avoids GPU↔CPU transfers)."""
+        return HAS_SCIPY and self.device.type == 'cpu'
+
     def _dct2(self, x: torch.Tensor) -> torch.Tensor:
         """
         Compute 2D Type-II DCT.
 
-        Uses scipy for accuracy when available, otherwise falls back
-        to PyTorch FFT-based implementation.
+        Uses PyTorch FFT on GPU devices (stays on device) and scipy
+        on CPU (faster for CPU-only workloads).
 
         Parameters
         ----------
@@ -202,18 +207,19 @@ class DCTUnwrapper(BaseUnwrapper):
         torch.Tensor
             DCT coefficients of shape (H, W).
         """
-        if HAS_SCIPY:
-            # Use scipy DCT (most accurate, CPU only)
+        if self._use_scipy:
             x_np = self.dm.to_numpy(x)
             result_np = dctn(x_np, type=2, norm='ortho')
             return self.dm.to_tensor(result_np)
         else:
-            # Fallback to PyTorch implementation
             return self._dct_pytorch(self._dct_pytorch(x, dim=1), dim=0)
 
     def _idct2(self, x: torch.Tensor) -> torch.Tensor:
         """
         Compute 2D inverse Type-II DCT.
+
+        Uses PyTorch FFT on GPU devices (stays on device) and scipy
+        on CPU (faster for CPU-only workloads).
 
         Parameters
         ----------
@@ -225,20 +231,19 @@ class DCTUnwrapper(BaseUnwrapper):
         torch.Tensor
             Reconstructed array of shape (H, W).
         """
-        if HAS_SCIPY:
-            # Use scipy IDCT (most accurate, CPU only)
+        if self._use_scipy:
             x_np = self.dm.to_numpy(x)
             result_np = idctn(x_np, type=2, norm='ortho')
             return self.dm.to_tensor(result_np)
         else:
-            # Fallback to PyTorch implementation
             return self._idct_pytorch(self._idct_pytorch(x, dim=0), dim=1)
 
     def _dct_pytorch(self, x: torch.Tensor, dim: int = -1) -> torch.Tensor:
         """
         Compute 1D Type-II DCT using PyTorch FFT.
 
-        Orthonormal DCT-II implementation.
+        Orthonormal DCT-II implementation that works on all devices
+        (CPU, CUDA, MPS).
 
         Parameters
         ----------
@@ -256,12 +261,12 @@ class DCTUnwrapper(BaseUnwrapper):
         x = x.movedim(dim, -1)
 
         # Reorder: even indices first, then odd indices reversed
-        # v[k] = x[2k] for k < ceil(N/2)
-        # v[k] = x[2N-2k-1] for k >= ceil(N/2)
         v = torch.empty_like(x)
         v[..., :(N + 1) // 2] = x[..., 0::2]
         if N > 1:
-            v[..., (N + 1) // 2:] = x[..., (N - 1 - (N % 2))::-2]
+            # Use torch.flip instead of negative step slicing (MPS compatible)
+            odd_indices = x[..., 1::2]
+            v[..., (N + 1) // 2:] = odd_indices.flip(dims=[-1])
 
         # FFT
         Vc = torch.fft.fft(v, dim=-1)
@@ -283,7 +288,8 @@ class DCTUnwrapper(BaseUnwrapper):
         """
         Compute 1D inverse Type-II DCT using PyTorch FFT.
 
-        Orthonormal IDCT-II implementation.
+        Orthonormal IDCT-II (= DCT-III with ortho norm) implementation
+        that works on all devices (CPU, CUDA, MPS).
 
         Parameters
         ----------
@@ -300,35 +306,27 @@ class DCTUnwrapper(BaseUnwrapper):
         N = X.shape[dim]
         X = X.movedim(dim, -1)
 
-        # Undo orthonormal scaling
-        scale = math.sqrt(2 * N)
-        X_scaled = X * scale
-        X_scaled[..., 0] = X_scaled[..., 0] / math.sqrt(2)
+        # Undo orthonormal scaling:
+        # DCT-II ortho has X[0] *= sqrt(1/N), X[k>0] *= sqrt(2/N)
+        # To invert: X_work[0] /= sqrt(2), then scale all by sqrt(2/N)
+        X_work = X * math.sqrt(2.0 / N)
+        X_work[..., 0] = X_work[..., 0] / math.sqrt(2)
 
-        # Phase factor for DCT-III
+        # Phase factor: exp(j * pi * k / (2N))
         k = torch.arange(N, dtype=self.dtype, device=self.device)
-        phase = torch.exp(1j * math.pi * k / (2 * N)) / 2.0
-        phase[0] = phase[0] * 2
+        phase = torch.exp(1j * math.pi * k / (2 * N))
 
-        X_complex = X_scaled * phase
+        V = X_work * phase
 
-        # Hermitian extension for real output
-        complex_dtype = torch.complex128 if self.dtype == torch.float64 else torch.complex64
-        X_full = torch.zeros(
-            X.shape[:-1] + (N,),
-            dtype=complex_dtype,
-            device=self.device,
-        )
-        X_full[...] = X_complex
+        # IFFT and take real part, scale by N
+        v = torch.fft.ifft(V, dim=-1).real * N
 
-        # IFFT
-        v = torch.fft.ifft(X_full, dim=-1).real * N
-
-        # Reorder back
+        # Unshuffle: x[2m] from first half, x[2m+1] from second half reversed
         x = torch.empty_like(v)
-        x[..., 0::2] = v[..., :(N + 1) // 2]
+        half = (N + 1) // 2
+        x[..., 0::2] = v[..., :half]
         if N > 1:
-            x[..., 1::2] = v[..., (N + 1) // 2:].flip(dims=[-1])
+            x[..., 1::2] = v[..., half:].flip(dims=[-1])
 
         return x.movedim(-1, dim)
 
