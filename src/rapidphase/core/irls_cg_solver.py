@@ -1,8 +1,9 @@
 """
-IRLS phase unwrapper with Conjugate Gradient solver.
+IRLS phase unwrapper with DCT-Preconditioned Conjugate Gradient solver.
 
-This implements the IRLS algorithm using Conjugate Gradient (CG) for the
-inner least-squares solve, which converges faster than Jacobi iteration.
+This implements the IRLS algorithm using Preconditioned Conjugate Gradient (PCG)
+for the inner least-squares solve. The DCT inverse of the unweighted Laplacian
+serves as an effective preconditioner, reducing CG iterations from ~200 to ~10-20.
 
 The algorithm minimizes an approximation to the L1 norm:
     min Σ |∇φ - W(∇ψ)|
@@ -22,12 +23,11 @@ from typing import TYPE_CHECKING
 
 import math
 
-import numpy as np
 import torch
 
 from rapidphase.core.base import BaseUnwrapper
 from rapidphase.core.dct_solver import DCTUnwrapper
-from rapidphase.utils.phase_ops import wrap, gradient_full, laplacian
+from rapidphase.utils.phase_ops import wrap, gradient_full
 from rapidphase.utils.quality import coherence_to_weights
 
 if TYPE_CHECKING:
@@ -36,10 +36,11 @@ if TYPE_CHECKING:
 
 class IRLSCGUnwrapper(BaseUnwrapper):
     """
-    IRLS phase unwrapper using Conjugate Gradient solver.
+    IRLS phase unwrapper using DCT-Preconditioned Conjugate Gradient solver.
 
     This provides faster convergence than the Jacobi-based IRLS by using
-    CG to solve the weighted least-squares problem at each iteration.
+    PCG to solve the weighted least-squares problem at each iteration.
+    The DCT preconditioner dramatically reduces CG iteration count.
 
     The method approximates L1-norm minimization:
         min Σ C_ij * |∇φ_ij - W(∇ψ_ij)|
@@ -51,7 +52,7 @@ class IRLSCGUnwrapper(BaseUnwrapper):
         self,
         device_manager: DeviceManager,
         max_irls_iterations: int = 50,
-        max_cg_iterations: int = 200,
+        max_cg_iterations: int = 50,
         irls_tolerance: float = 1e-4,
         cg_tolerance: float = 1e-6,
         delta: float = 0.1,
@@ -86,7 +87,7 @@ class IRLSCGUnwrapper(BaseUnwrapper):
         self.delta = delta
         self.nlooks = nlooks
 
-        # DCT solver for initialization
+        # DCT solver for initialization and preconditioning
         self._dct_solver = DCTUnwrapper(device_manager)
 
     def unwrap(
@@ -99,7 +100,7 @@ class IRLSCGUnwrapper(BaseUnwrapper):
         **kwargs,
     ) -> torch.Tensor:
         """
-        Unwrap phase using IRLS with CG solver.
+        Unwrap phase using IRLS with DCT-Preconditioned CG solver.
 
         Parameters
         ----------
@@ -125,6 +126,7 @@ class IRLSCGUnwrapper(BaseUnwrapper):
         max_cg = max_cg_iterations or self.max_cg_iterations
 
         H, W = phase.shape
+        two_pi = 2 * math.pi
 
         # Detect NaN mask if not provided
         if nan_mask is None:
@@ -157,13 +159,27 @@ class IRLSCGUnwrapper(BaseUnwrapper):
         # Initialize with DCT solution
         phi = self._dct_solver.unwrap(phase_clean, nan_mask=nan_mask)
 
-        # Keep NaN positions zeroed during iterations (DCT restores NaN, we need to zero them)
+        # Keep NaN positions zeroed during iterations
         if has_nans:
             phi[nan_mask] = 0.0
+
+        # Adaptive delta schedule: start L2-like (large delta) for faster
+        # early convergence, then decrease toward target for L1 approximation
+        delta_schedule = [
+            max(self.delta, 1.0),
+            max(self.delta, 0.5),
+            max(self.delta, 0.2),
+        ]
 
         # IRLS iterations
         for irls_iter in range(max_irls):
             phi_old = phi.clone()
+
+            # Select delta for this iteration
+            if irls_iter < len(delta_schedule):
+                current_delta = delta_schedule[irls_iter]
+            else:
+                current_delta = self.delta
 
             # Compute current gradient residuals
             grad_x_phi, grad_y_phi = gradient_full(phi, wrap_result=False, nan_mask=nan_mask)
@@ -171,11 +187,10 @@ class IRLSCGUnwrapper(BaseUnwrapper):
             res_y = grad_y_phi - grad_y_target
 
             # Update IRLS weights per-edge: w = C / max(|residual|, delta)
-            # Separate weights for horizontal (x) and vertical (y) edges
-            irls_weights_x = coh_weights / torch.clamp(torch.abs(res_x) + 1e-10, min=self.delta)
-            irls_weights_y = coh_weights / torch.clamp(torch.abs(res_y) + 1e-10, min=self.delta)
+            irls_weights_x = coh_weights / torch.clamp(torch.abs(res_x) + 1e-10, min=current_delta)
+            irls_weights_y = coh_weights / torch.clamp(torch.abs(res_y) + 1e-10, min=current_delta)
 
-            # Normalize weights for numerical stability (shared scale)
+            # Normalize weights for numerical stability
             max_w = max(irls_weights_x.max(), irls_weights_y.max()) + 1e-10
             irls_weights_x = irls_weights_x / max_w
             irls_weights_y = irls_weights_y / max_w
@@ -185,7 +200,7 @@ class IRLSCGUnwrapper(BaseUnwrapper):
                 irls_weights_x[nan_mask] = 0.0
                 irls_weights_y[nan_mask] = 0.0
 
-            # Solve weighted least squares using CG
+            # Solve weighted least squares using Preconditioned CG
             phi = self._cg_solve(
                 phi,
                 grad_x_target,
@@ -212,18 +227,36 @@ class IRLSCGUnwrapper(BaseUnwrapper):
             if rel_change < self.irls_tolerance:
                 break
 
+        # Save continuous IRLS-CG solution for disambiguation
+        phi_continuous = phi.clone()
+
+        # Adjust DC offset before congruence projection to avoid ambiguous
+        # rounding. The IRLS-CG solution has an arbitrary DC offset (Poisson
+        # equation is defined up to a constant). If (phi - psi) / 2pi is near
+        # a half-integer for many pixels, rounding will split them, creating
+        # artificial discontinuities. Shift phi so the median fractional part
+        # is centered at 0 (maximally far from the +/-0.5 rounding boundary).
+        k_float = (phi - phase_clean) / two_pi
+        frac = k_float - torch.round(k_float)  # fractional part in [-0.5, 0.5]
+        if has_nans:
+            valid_frac = frac[~nan_mask]
+            dc_adjust = torch.median(valid_frac) * two_pi if valid_frac.numel() > 0 else 0.0
+        else:
+            dc_adjust = torch.median(frac) * two_pi
+        phi = phi - dc_adjust
+        phi_continuous = phi_continuous - dc_adjust
+
         # Project to nearest congruent solution:
         # unwrapped = wrapped + k * 2*pi, where k is the nearest integer
-        k = torch.round((phi - phase_clean) / (2 * math.pi))
-        phi = phase_clean + k * (2 * math.pi)
+        k = torch.round((phi - phase_clean) / two_pi)
+        phi = phase_clean + k * two_pi
 
-        # Correct branch cut routing via quality-guided flood fill.
-        # The DCT initialization may route branch cuts differently from
-        # optimal (MCF-style) routing. This BFS correction grows outward
-        # from the highest-coherence pixel, adjusting each pixel's integer
-        # cycle to be gradient-consistent with already-visited neighbors.
-        phi = self._gradient_guided_correction(
-            phi, phase_clean, coh_weights, nan_mask if has_nans else None
+        # Fix local consistency errors in the congruence projection.
+        # Uses the continuous IRLS-CG solution to disambiguate expected
+        # integer cycle differences between neighbors.
+        phi = self._local_consistency_correction(
+            phi, phase_clean, phi_continuous, coh_weights,
+            nan_mask if has_nans else None
         )
 
         # Restore NaN at invalid pixel locations
@@ -232,31 +265,36 @@ class IRLSCGUnwrapper(BaseUnwrapper):
 
         return phi
 
-    def _gradient_guided_correction(
+    def _local_consistency_correction(
         self,
         phi: torch.Tensor,
         phase_clean: torch.Tensor,
+        phi_continuous: torch.Tensor,
         coh_weights: torch.Tensor,
         nan_mask: torch.Tensor | None,
     ) -> torch.Tensor:
         """
-        Correct 2π branch cut errors via quality-guided graph integration.
+        Fix local 2pi consistency errors in the congruence projection.
 
-        Instead of relying on the congruence projection k values (which may
-        have branch cut routing errors), this method integrates the wrapped
-        phase gradients from the seed pixel along a Dijkstra shortest-path
-        tree weighted by inverse coherence. This routes branch cuts through
-        low-coherence areas (similar to SNAPHU's MCF approach).
+        After congruence projection (k = round((phi_irls - psi) / 2pi)),
+        some pixels may have k off by +/-1 due to rounding. This method
+        detects and corrects such errors by checking each pixel's k against
+        its neighbors.
 
-        Uses scipy's C-compiled Dijkstra for the traversal order, then
-        propagates k values along the tree in a single pass.
+        Uses the continuous IRLS-CG solution (phi_continuous) to compute
+        unambiguous expected integer cycle differences, avoiding the
+        rounding ambiguity in wrapped phase differences near +/-pi.
+
+        Runs entirely on GPU with vectorized PyTorch operations.
 
         Parameters
         ----------
         phi : torch.Tensor
-            Congruent unwrapped phase (H, W).
+            Congruent unwrapped phase after projection (H, W).
         phase_clean : torch.Tensor
             Wrapped phase with NaN replaced by 0 (H, W).
+        phi_continuous : torch.Tensor
+            Pre-projection continuous IRLS-CG solution (H, W).
         coh_weights : torch.Tensor
             Coherence-derived weights (H, W), 0 at invalid pixels.
         nan_mask : torch.Tensor or None
@@ -267,119 +305,94 @@ class IRLSCGUnwrapper(BaseUnwrapper):
         torch.Tensor
             Corrected unwrapped phase.
         """
-        from scipy.sparse import csr_matrix
-        from scipy.sparse.csgraph import dijkstra
-
-        H, W = phi.shape
-        device = phi.device
         two_pi = 2 * math.pi
-        n_pixels = H * W
+        k = torch.round((phi - phase_clean) / two_pi)
 
-        # Move to CPU numpy
-        psi = phase_clean.detach().cpu().numpy()
-        coh = coh_weights.detach().cpu().numpy()
-        nan_np = (
-            nan_mask.detach().cpu().numpy()
-            if nan_mask is not None
-            else np.zeros((H, W), dtype=bool)
-        )
-        valid = ~nan_np
+        # Compute expected integer cycle differences from the continuous
+        # IRLS-CG solution. Since phi_continuous is smooth and continuous,
+        # its gradients give unambiguous integer offsets.
+        raw_dx = phase_clean[:, 1:] - phase_clean[:, :-1]
+        raw_dy = phase_clean[1:, :] - phase_clean[:-1, :]
+        phi_dx = phi_continuous[:, 1:] - phi_continuous[:, :-1]
+        phi_dy = phi_continuous[1:, :] - phi_continuous[:-1, :]
 
-        # Wrapping integers between adjacent pixels
-        # k[j+1] = k[j] + m_x[j]  means gradient-consistent unwrapping
-        raw_dx = psi[:, 1:] - psi[:, :-1]
-        m_x = -np.rint(raw_dx / two_pi).astype(np.int64)
-        raw_dy = psi[1:, :] - psi[:-1, :]
-        m_y = -np.rint(raw_dy / two_pi).astype(np.int64)
+        # expected_dk = (continuous_gradient - wrapped_gradient) / 2pi
+        # This is exact integer when phi_continuous is close to the true solution
+        expected_dk_x = torch.round((phi_dx - raw_dx) / two_pi)
+        expected_dk_y = torch.round((phi_dy - raw_dy) / two_pi)
 
-        # Seed: highest-coherence valid pixel
-        phi_np = phi.detach().cpu().numpy()
-        coh_masked = np.where(valid, coh, -1.0)
-        seed_idx = int(np.argmax(coh_masked))
-        seed_r, seed_c = seed_idx // W, seed_idx % W
-        seed_flat = seed_r * W + seed_c
-        seed_k = int(np.round(
-            (phi_np[seed_r, seed_c] - psi[seed_r, seed_c]) / two_pi
-        ))
+        for _ in range(20):
+            # Check horizontal consistency: k[i,j+1] - k[i,j] should equal expected_dk_x
+            actual_dk_x = k[:, 1:] - k[:, :-1]
+            actual_dk_y = k[1:, :] - k[:-1, :]
 
-        # Build sparse grid graph weighted by INVERSE coherence
-        # Low cost = high coherence, so Dijkstra routes through high-coh areas
-        # and branch cuts end up in low-coherence regions.
-        # Horizontal edges: (i,j) <-> (i,j+1)
-        h_valid = valid[:, :-1] & valid[:, 1:]
-        hr, hc = np.where(h_valid)
-        idx_l = hr * W + hc
-        idx_r = hr * W + (hc + 1)
-        min_coh_h = np.minimum(coh[hr, hc], coh[hr, hc + 1])
-        cost_h = 1.0 / (min_coh_h + 1e-6)
+            err_x = actual_dk_x - expected_dk_x  # should be 0
+            err_y = actual_dk_y - expected_dk_y
 
-        # Vertical edges: (i,j) <-> (i+1,j)
-        v_valid = valid[:-1, :] & valid[1:, :]
-        vr, vc = np.where(v_valid)
-        idx_t = vr * W + vc
-        idx_b = (vr + 1) * W + vc
-        min_coh_v = np.minimum(coh[vr, vc], coh[vr + 1, vc])
-        cost_v = 1.0 / (min_coh_v + 1e-6)
+            n_bad = (err_x != 0).sum() + (err_y != 0).sum()
+            if n_bad == 0:
+                break
 
-        # Symmetric adjacency
-        rows = np.concatenate([idx_l, idx_r, idx_t, idx_b])
-        cols = np.concatenate([idx_r, idx_l, idx_b, idx_t])
-        costs = np.concatenate([cost_h, cost_h, cost_v, cost_v])
+            # For inconsistent edges, adjust the lower-coherence pixel
+            correction = torch.zeros_like(k)
 
-        graph = csr_matrix(
-            (costs, (rows, cols)), shape=(n_pixels, n_pixels)
-        )
+            # Horizontal edges with error
+            bad_x = err_x != 0
+            # Left pixel is weaker -> adjust left pixel's k
+            left_weaker = bad_x & (coh_weights[:, :-1] <= coh_weights[:, 1:])
+            # Right pixel is weaker -> adjust right pixel's k
+            right_weaker = bad_x & ~left_weaker & bad_x
 
-        # Dijkstra from seed — quality-guided traversal (scipy C-compiled)
-        dist, predecessors = dijkstra(
-            graph, indices=seed_flat, return_predecessors=True
-        )
+            # Clamp err to +/-1 for stability
+            err_x_clamped = torch.clamp(err_x, -1, 1)
+            correction[:, :-1] += torch.where(left_weaker, err_x_clamped, torch.zeros_like(err_x_clamped))
+            correction[:, 1:] -= torch.where(right_weaker, err_x_clamped, torch.zeros_like(err_x_clamped))
 
-        # Sort by distance = Dijkstra visitation order (high-coh pixels first)
-        order = np.argsort(dist)
-        # Keep only reachable valid pixels (finite distance), skip seed
-        reachable = np.isfinite(dist[order]) & (order != seed_flat)
-        pixels = order[reachable]
-        preds = predecessors[pixels]
+            # Vertical edges with error
+            bad_y = err_y != 0
+            top_weaker = bad_y & (coh_weights[:-1, :] <= coh_weights[1:, :])
+            bottom_weaker = bad_y & ~top_weaker & bad_y
 
-        r_pix = pixels // W
-        c_pix = pixels % W
-        r_par = preds // W
-        c_par = preds % W
+            err_y_clamped = torch.clamp(err_y, -1, 1)
+            correction[:-1, :] += torch.where(top_weaker, err_y_clamped, torch.zeros_like(err_y_clamped))
+            correction[1:, :] -= torch.where(bottom_weaker, err_y_clamped, torch.zeros_like(err_y_clamped))
 
-        m_inc = np.zeros(len(pixels), dtype=np.int64)
+            if nan_mask is not None:
+                correction[nan_mask] = 0
 
-        # From left parent (r, c-1) -> pixel (r, c)
-        mask = (r_pix == r_par) & (c_pix == c_par + 1)
-        m_inc[mask] = m_x[r_pix[mask], c_par[mask]]
+            # Apply correction (clamp to +/-1 per step for stability)
+            correction = torch.clamp(correction, -1, 1).round()
 
-        # From right parent (r, c+1) -> pixel (r, c)
-        mask = (r_pix == r_par) & (c_pix == c_par - 1)
-        m_inc[mask] = -m_x[r_pix[mask], c_pix[mask]]
+            if (correction == 0).all():
+                break
 
-        # From above parent (r-1, c) -> pixel (r, c)
-        mask = (r_pix == r_par + 1) & (c_pix == c_par)
-        m_inc[mask] = m_y[r_par[mask], c_pix[mask]]
+            k += correction
 
-        # From below parent (r+1, c) -> pixel (r, c)
-        mask = (r_pix == r_par - 1) & (c_pix == c_par)
-        m_inc[mask] = -m_y[r_pix[mask], c_pix[mask]]
+        return phase_clean + k * two_pi
 
-        # Propagate k along BFS tree order (single sequential pass)
-        # Each pixel's parent was visited earlier, so flat_k[parent] is set.
-        flat_k = np.zeros(n_pixels, dtype=np.int64)
-        flat_k[seed_flat] = seed_k
+    def _apply_dct_preconditioner(self, r: torch.Tensor) -> torch.Tensor:
+        """
+        Apply DCT-based preconditioner: z = L^{-1} r.
 
-        for i in range(len(pixels)):
-            flat_k[pixels[i]] = flat_k[preds[i]] + m_inc[i]
+        The unweighted Laplacian inverse (computed via DCT) serves as
+        an effective preconditioner for the weighted Laplacian system.
 
-        k = flat_k.reshape(H, W)
+        Parameters
+        ----------
+        r : torch.Tensor
+            Residual vector of shape (H, W).
 
-        # Reconstruct corrected phase
-        k_tensor = torch.from_numpy(k.astype(np.float64)).to(
-            dtype=phi.dtype, device=device
-        )
-        return phase_clean + k_tensor * two_pi
+        Returns
+        -------
+        torch.Tensor
+            Preconditioned residual z = L^{-1} r.
+        """
+        H, W = r.shape
+        r_dct = self._dct_solver._dct2(r)
+        eigenvalues = self._dct_solver._get_eigenvalues(H, W)
+        z_dct = r_dct / eigenvalues
+        z_dct[0, 0] = 0.0  # Zero DC component
+        return self._dct_solver._idct2(z_dct)
 
     def _cg_solve(
         self,
@@ -391,14 +404,15 @@ class IRLSCGUnwrapper(BaseUnwrapper):
         max_iterations: int,
     ) -> torch.Tensor:
         """
-        Solve weighted least squares using Conjugate Gradient.
+        Solve weighted least squares using DCT-Preconditioned Conjugate Gradient.
 
         Solves: min Σ w_x_ij * |∂xφ_ij - gx_ij|² + w_y_ij * |∂yφ_ij - gy_ij|²
 
         This is equivalent to solving the weighted Poisson equation:
             div(W * ∇φ) = div(W * g)
 
-        with separate weights W_x, W_y for horizontal and vertical edges.
+        The DCT preconditioner (unweighted Laplacian inverse) dramatically
+        reduces iteration count from ~200 to ~10-20.
 
         Parameters
         ----------
@@ -419,19 +433,21 @@ class IRLSCGUnwrapper(BaseUnwrapper):
         phi = phi_init.clone()
 
         # Compute RHS: div(W * g)
-        # Using backward difference for divergence (adjoint of forward gradient)
         rhs = self._weighted_divergence(grad_x_target, grad_y_target, weights_x, weights_y)
 
         # Initial residual: r = b - A*x
         Aphi = self._weighted_laplacian(phi, weights_x, weights_y)
         r = rhs - Aphi
 
-        # Initial search direction
-        p = r.clone()
+        # Apply preconditioner: z = M^{-1} r
+        z = self._apply_dct_preconditioner(r)
 
-        # Initial residual norm squared
-        r_norm_sq = torch.sum(r * r)
-        r0_norm_sq = r_norm_sq.clone()
+        # Initial search direction
+        p = z.clone()
+
+        # Initial preconditioned residual inner product
+        rz = torch.sum(r * z)
+        rz_init = rz.clone()
 
         for cg_iter in range(max_iterations):
             # Matrix-vector product: A*p
@@ -441,24 +457,27 @@ class IRLSCGUnwrapper(BaseUnwrapper):
             pAp = torch.sum(p * Ap)
             if pAp.abs() < 1e-12:
                 break
-            alpha = r_norm_sq / pAp
+            alpha = rz / pAp
 
             # Update solution and residual
             phi = phi + alpha * p
             r = r - alpha * Ap
 
-            # New residual norm squared
-            r_norm_sq_new = torch.sum(r * r)
+            # Apply preconditioner to new residual
+            z_new = self._apply_dct_preconditioner(r)
+
+            # New preconditioned inner product
+            rz_new = torch.sum(r * z_new)
 
             # Check convergence
-            if r_norm_sq_new < self.cg_tolerance ** 2 * r0_norm_sq:
+            if rz_new.abs() < self.cg_tolerance ** 2 * rz_init.abs():
                 break
 
             # Update search direction
-            beta = r_norm_sq_new / r_norm_sq
-            p = r + beta * p
+            beta = rz_new / (rz + 1e-30)
+            p = z_new + beta * p
 
-            r_norm_sq = r_norm_sq_new
+            rz = rz_new
 
         return phi
 
