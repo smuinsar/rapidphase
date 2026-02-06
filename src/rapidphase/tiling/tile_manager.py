@@ -170,9 +170,12 @@ class TileManager:
         """
         Align phase offsets between adjacent tiles.
 
-        Each tile from phase unwrapping has an arbitrary constant offset.
-        This method computes and applies corrections so that overlapping
-        regions have consistent phase values.
+        Each tile from phase unwrapping has an arbitrary constant offset
+        (integer multiple of 2*pi). This method computes and applies
+        corrections so tiles have consistent phase values.
+
+        Uses priority BFS: tiles with more valid overlap pixels are
+        aligned first to avoid propagating errors through NaN-heavy links.
 
         Parameters
         ----------
@@ -187,89 +190,72 @@ class TileManager:
         if len(tiles_data) <= 1:
             return tiles_data
 
+        import heapq
+        import math
+
         n_rows, n_cols = self.ntiles
+        two_pi = 2 * math.pi
 
         # Create a dictionary for easy lookup by (row, col) index
         tile_dict = {}
         for tile, data in tiles_data:
             tile_dict[(tile.row_idx, tile.col_idx)] = (tile, data.clone())
 
-        # Track which tiles have been aligned
         aligned = set()
-        # Store offsets to apply
-        offsets = {(0, 0): 0.0}  # First tile is reference
+        offsets = {(0, 0): 0.0}
         aligned.add((0, 0))
 
-        # BFS to propagate alignment from tile (0,0)
-        queue = [(0, 0)]
+        pq: list[tuple[int, tuple[int, int], float]] = []
 
-        while queue:
-            curr_idx = queue.pop(0)
+        def add_neighbors(curr_idx):
             curr_tile, curr_data = tile_dict[curr_idx]
             curr_offset = offsets[curr_idx]
-
-            # Check all neighbors (right and down primarily, but also left and up)
             neighbors = [
-                (curr_idx[0], curr_idx[1] + 1),  # right
-                (curr_idx[0] + 1, curr_idx[1]),  # down
-                (curr_idx[0], curr_idx[1] - 1),  # left
-                (curr_idx[0] - 1, curr_idx[1]),  # up
+                (curr_idx[0], curr_idx[1] + 1),
+                (curr_idx[0] + 1, curr_idx[1]),
+                (curr_idx[0], curr_idx[1] - 1),
+                (curr_idx[0] - 1, curr_idx[1]),
             ]
-
             for neighbor_idx in neighbors:
-                if neighbor_idx in aligned:
+                if neighbor_idx in aligned or neighbor_idx not in tile_dict:
                     continue
-                if neighbor_idx not in tile_dict:
-                    continue
-
                 neighbor_tile, neighbor_data = tile_dict[neighbor_idx]
 
-                # Find overlapping region in global coordinates
-                overlap_row_start = max(curr_tile.row_start, neighbor_tile.row_start)
-                overlap_row_end = min(curr_tile.row_end, neighbor_tile.row_end)
-                overlap_col_start = max(curr_tile.col_start, neighbor_tile.col_start)
-                overlap_col_end = min(curr_tile.col_end, neighbor_tile.col_end)
-
-                # Check if there's actual overlap
-                if overlap_row_start >= overlap_row_end or overlap_col_start >= overlap_col_end:
+                # Full overlap region
+                or_s = max(curr_tile.row_start, neighbor_tile.row_start)
+                or_e = min(curr_tile.row_end, neighbor_tile.row_end)
+                oc_s = max(curr_tile.col_start, neighbor_tile.col_start)
+                oc_e = min(curr_tile.col_end, neighbor_tile.col_end)
+                if or_s >= or_e or oc_s >= oc_e:
                     continue
 
-                # Extract overlap regions from both tiles (in local coordinates)
-                curr_local_row_start = overlap_row_start - curr_tile.row_start
-                curr_local_row_end = overlap_row_end - curr_tile.row_start
-                curr_local_col_start = overlap_col_start - curr_tile.col_start
-                curr_local_col_end = overlap_col_end - curr_tile.col_start
-
-                neighbor_local_row_start = overlap_row_start - neighbor_tile.row_start
-                neighbor_local_row_end = overlap_row_end - neighbor_tile.row_start
-                neighbor_local_col_start = overlap_col_start - neighbor_tile.col_start
-                neighbor_local_col_end = overlap_col_end - neighbor_tile.col_start
-
                 curr_overlap = curr_data[
-                    curr_local_row_start:curr_local_row_end,
-                    curr_local_col_start:curr_local_col_end
+                    or_s - curr_tile.row_start:or_e - curr_tile.row_start,
+                    oc_s - curr_tile.col_start:oc_e - curr_tile.col_start
                 ]
                 neighbor_overlap = neighbor_data[
-                    neighbor_local_row_start:neighbor_local_row_end,
-                    neighbor_local_col_start:neighbor_local_col_end
+                    or_s - neighbor_tile.row_start:or_e - neighbor_tile.row_start,
+                    oc_s - neighbor_tile.col_start:oc_e - neighbor_tile.col_start
                 ]
 
-                # Compute offset: neighbor should match curr (after curr's offset is applied)
-                # Use median for robustness to outliers
                 diff = (curr_overlap + curr_offset) - neighbor_overlap
+                valid_mask = ~torch.isnan(diff)
+                n_valid = int(valid_mask.sum().item())
 
-                # Handle NaN values by masking them out before computing median
-                valid_mask = ~(torch.isnan(diff))
-                if valid_mask.any():
-                    valid_diff = diff[valid_mask]
-                    offset = torch.median(valid_diff).item()
-                else:
-                    # No valid overlap, use zero offset
-                    offset = 0.0
+                if n_valid > 0:
+                    raw_offset = torch.median(diff[valid_mask]).item()
+                    offset = round(raw_offset / two_pi) * two_pi
+                    heapq.heappush(pq, (-n_valid, neighbor_idx, offset))
 
-                offsets[neighbor_idx] = offset
-                aligned.add(neighbor_idx)
-                queue.append(neighbor_idx)
+        add_neighbors((0, 0))
+
+        while pq:
+            neg_nvalid, neighbor_idx, offset = heapq.heappop(pq)
+            if neighbor_idx in aligned:
+                continue
+            offsets[neighbor_idx] = offset
+            aligned.add(neighbor_idx)
+            add_neighbors(neighbor_idx)
 
         # Apply offsets to all tiles
         aligned_tiles = []
@@ -749,6 +735,59 @@ class TileManager:
 
         return result
 
+    def _compute_overlap_offset_numpy(
+        self,
+        curr_tile: TileInfo,
+        curr_data: np.ndarray,
+        curr_offset: float,
+        neighbor_tile: TileInfo,
+        neighbor_data: np.ndarray,
+    ) -> tuple[float, int]:
+        """
+        Compute phase offset between two overlapping tiles.
+
+        Uses the full overlap region (no center-margin cropping) since NaN-heavy
+        tiles may only have valid pixels near edges.
+
+        Returns
+        -------
+        offset : float
+            Phase offset to apply to neighbor tile.
+        n_valid : int
+            Number of valid overlap pixels used.
+        """
+        # Find overlapping region in global coordinates
+        overlap_row_start = max(curr_tile.row_start, neighbor_tile.row_start)
+        overlap_row_end = min(curr_tile.row_end, neighbor_tile.row_end)
+        overlap_col_start = max(curr_tile.col_start, neighbor_tile.col_start)
+        overlap_col_end = min(curr_tile.col_end, neighbor_tile.col_end)
+
+        if overlap_row_start >= overlap_row_end or overlap_col_start >= overlap_col_end:
+            return 0.0, 0
+
+        # Extract overlap regions in local coordinates
+        curr_overlap = curr_data[
+            overlap_row_start - curr_tile.row_start:overlap_row_end - curr_tile.row_start,
+            overlap_col_start - curr_tile.col_start:overlap_col_end - curr_tile.col_start
+        ]
+        neighbor_overlap = neighbor_data[
+            overlap_row_start - neighbor_tile.row_start:overlap_row_end - neighbor_tile.row_start,
+            overlap_col_start - neighbor_tile.col_start:overlap_col_end - neighbor_tile.col_start
+        ]
+
+        diff = (curr_overlap + curr_offset) - neighbor_overlap
+        valid_mask = ~np.isnan(diff)
+        n_valid = int(valid_mask.sum())
+
+        if n_valid > 0:
+            # Round offset to nearest 2*pi multiple for phase unwrapping
+            # (tile offsets should always be integer multiples of 2*pi)
+            raw_offset = float(np.median(diff[valid_mask]))
+            offset = round(raw_offset / (2 * np.pi)) * (2 * np.pi)
+            return offset, n_valid
+        else:
+            return 0.0, 0
+
     def _align_tile_phases_numpy(
         self,
         tiles_data: list[tuple[TileInfo, np.ndarray]],
@@ -756,11 +795,12 @@ class TileManager:
         """
         Align phase offsets between adjacent tiles (numpy/CPU version).
 
-        Each tile from phase unwrapping has an arbitrary constant offset.
-        This method computes and applies corrections so that overlapping
-        regions have consistent phase values.
+        Each tile from phase unwrapping has an arbitrary constant offset
+        (integer multiple of 2*pi). This method computes and applies
+        corrections so tiles have consistent phase values.
 
-        Uses the center band of the overlap region to avoid edge artifacts.
+        Uses BFS with priority: tiles with more valid overlap pixels are
+        aligned first to avoid propagating errors through NaN-heavy links.
         """
         if len(tiles_data) <= 1:
             return tiles_data
@@ -774,99 +814,47 @@ class TileManager:
 
         # Track which tiles have been aligned
         aligned = set()
-        # Store offsets to apply
         offsets = {(0, 0): 0.0}  # First tile is reference
         aligned.add((0, 0))
 
-        # BFS to propagate alignment from tile (0,0)
-        queue = [(0, 0)]
+        # Priority queue: (negative n_valid for max-first, neighbor_idx, offset)
+        # Start by evaluating all neighbors of (0,0)
+        import heapq
+        pq: list[tuple[int, tuple[int, int], float]] = []
 
-        while queue:
-            curr_idx = queue.pop(0)
+        def add_neighbors(curr_idx):
+            """Add unaligned neighbors to the priority queue."""
             curr_tile, curr_data = tile_dict[curr_idx]
             curr_offset = offsets[curr_idx]
-
-            # Check all neighbors (right and down primarily, but also left and up)
             neighbors = [
-                (curr_idx[0], curr_idx[1] + 1),  # right
-                (curr_idx[0] + 1, curr_idx[1]),  # down
-                (curr_idx[0], curr_idx[1] - 1),  # left
-                (curr_idx[0] - 1, curr_idx[1]),  # up
+                (curr_idx[0], curr_idx[1] + 1),
+                (curr_idx[0] + 1, curr_idx[1]),
+                (curr_idx[0], curr_idx[1] - 1),
+                (curr_idx[0] - 1, curr_idx[1]),
             ]
-
             for neighbor_idx in neighbors:
-                if neighbor_idx in aligned:
+                if neighbor_idx in aligned or neighbor_idx not in tile_dict:
                     continue
-                if neighbor_idx not in tile_dict:
-                    continue
-
                 neighbor_tile, neighbor_data = tile_dict[neighbor_idx]
+                offset, n_valid = self._compute_overlap_offset_numpy(
+                    curr_tile, curr_data, curr_offset,
+                    neighbor_tile, neighbor_data,
+                )
+                if n_valid > 0:
+                    # Use negative n_valid so heapq gives us the largest first
+                    heapq.heappush(pq, (-n_valid, neighbor_idx, offset))
 
-                # Find overlapping region in global coordinates
-                overlap_row_start = max(curr_tile.row_start, neighbor_tile.row_start)
-                overlap_row_end = min(curr_tile.row_end, neighbor_tile.row_end)
-                overlap_col_start = max(curr_tile.col_start, neighbor_tile.col_start)
-                overlap_col_end = min(curr_tile.col_end, neighbor_tile.col_end)
+        add_neighbors((0, 0))
 
-                # Check if there's actual overlap
-                if overlap_row_start >= overlap_row_end or overlap_col_start >= overlap_col_end:
-                    continue
+        while pq:
+            neg_nvalid, neighbor_idx, offset = heapq.heappop(pq)
 
-                # Use center 50% of overlap region to avoid edge artifacts
-                overlap_h = overlap_row_end - overlap_row_start
-                overlap_w = overlap_col_end - overlap_col_start
-                margin_h = overlap_h // 4
-                margin_w = overlap_w // 4
+            if neighbor_idx in aligned:
+                continue  # Already aligned through a better path
 
-                center_row_start = overlap_row_start + margin_h
-                center_row_end = overlap_row_end - margin_h
-                center_col_start = overlap_col_start + margin_w
-                center_col_end = overlap_col_end - margin_w
-
-                # Ensure we have at least some pixels
-                if center_row_start >= center_row_end:
-                    center_row_start = overlap_row_start
-                    center_row_end = overlap_row_end
-                if center_col_start >= center_col_end:
-                    center_col_start = overlap_col_start
-                    center_col_end = overlap_col_end
-
-                # Extract center overlap regions from both tiles (in local coordinates)
-                curr_local_row_start = center_row_start - curr_tile.row_start
-                curr_local_row_end = center_row_end - curr_tile.row_start
-                curr_local_col_start = center_col_start - curr_tile.col_start
-                curr_local_col_end = center_col_end - curr_tile.col_start
-
-                neighbor_local_row_start = center_row_start - neighbor_tile.row_start
-                neighbor_local_row_end = center_row_end - neighbor_tile.row_start
-                neighbor_local_col_start = center_col_start - neighbor_tile.col_start
-                neighbor_local_col_end = center_col_end - neighbor_tile.col_start
-
-                curr_overlap = curr_data[
-                    curr_local_row_start:curr_local_row_end,
-                    curr_local_col_start:curr_local_col_end
-                ]
-                neighbor_overlap = neighbor_data[
-                    neighbor_local_row_start:neighbor_local_row_end,
-                    neighbor_local_col_start:neighbor_local_col_end
-                ]
-
-                # Compute offset: neighbor should match curr (after curr's offset is applied)
-                # Use median for robustness to outliers
-                diff = (curr_overlap + curr_offset) - neighbor_overlap
-
-                # Handle NaN values by masking them out before computing median
-                valid_mask = ~np.isnan(diff)
-                if valid_mask.any():
-                    valid_diff = diff[valid_mask]
-                    offset = float(np.median(valid_diff))
-                else:
-                    # No valid overlap, use zero offset
-                    offset = 0.0
-
-                offsets[neighbor_idx] = offset
-                aligned.add(neighbor_idx)
-                queue.append(neighbor_idx)
+            offsets[neighbor_idx] = offset
+            aligned.add(neighbor_idx)
+            add_neighbors(neighbor_idx)
 
         # Apply offsets to all tiles
         aligned_tiles = []
