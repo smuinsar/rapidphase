@@ -20,6 +20,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import math
+
+import numpy as np
 import torch
 
 from rapidphase.core.base import BaseUnwrapper
@@ -47,8 +50,8 @@ class IRLSCGUnwrapper(BaseUnwrapper):
     def __init__(
         self,
         device_manager: DeviceManager,
-        max_irls_iterations: int = 20,
-        max_cg_iterations: int = 100,
+        max_irls_iterations: int = 50,
+        max_cg_iterations: int = 200,
         irls_tolerance: float = 1e-4,
         cg_tolerance: float = 1e-6,
         delta: float = 0.1,
@@ -167,23 +170,28 @@ class IRLSCGUnwrapper(BaseUnwrapper):
             res_x = grad_x_phi - grad_x_target
             res_y = grad_y_phi - grad_y_target
 
-            # Update IRLS weights: w = C / max(|residual|, delta)
-            residual_mag = torch.sqrt(res_x ** 2 + res_y ** 2 + 1e-10)
-            irls_weights = coh_weights / torch.clamp(residual_mag, min=self.delta)
+            # Update IRLS weights per-edge: w = C / max(|residual|, delta)
+            # Separate weights for horizontal (x) and vertical (y) edges
+            irls_weights_x = coh_weights / torch.clamp(torch.abs(res_x) + 1e-10, min=self.delta)
+            irls_weights_y = coh_weights / torch.clamp(torch.abs(res_y) + 1e-10, min=self.delta)
 
-            # Normalize weights for numerical stability
-            irls_weights = irls_weights / (irls_weights.max() + 1e-10)
+            # Normalize weights for numerical stability (shared scale)
+            max_w = max(irls_weights_x.max(), irls_weights_y.max()) + 1e-10
+            irls_weights_x = irls_weights_x / max_w
+            irls_weights_y = irls_weights_y / max_w
 
             # Set weights to 0 for NaN pixels
             if has_nans:
-                irls_weights[nan_mask] = 0.0
+                irls_weights_x[nan_mask] = 0.0
+                irls_weights_y[nan_mask] = 0.0
 
             # Solve weighted least squares using CG
             phi = self._cg_solve(
                 phi,
                 grad_x_target,
                 grad_y_target,
-                irls_weights,
+                irls_weights_x,
+                irls_weights_y,
                 max_cg,
             )
 
@@ -204,27 +212,193 @@ class IRLSCGUnwrapper(BaseUnwrapper):
             if rel_change < self.irls_tolerance:
                 break
 
+        # Project to nearest congruent solution:
+        # unwrapped = wrapped + k * 2*pi, where k is the nearest integer
+        k = torch.round((phi - phase_clean) / (2 * math.pi))
+        phi = phase_clean + k * (2 * math.pi)
+
+        # Correct branch cut routing via quality-guided flood fill.
+        # The DCT initialization may route branch cuts differently from
+        # optimal (MCF-style) routing. This BFS correction grows outward
+        # from the highest-coherence pixel, adjusting each pixel's integer
+        # cycle to be gradient-consistent with already-visited neighbors.
+        phi = self._gradient_guided_correction(
+            phi, phase_clean, coh_weights, nan_mask if has_nans else None
+        )
+
         # Restore NaN at invalid pixel locations
         if has_nans:
             phi[nan_mask] = float('nan')
 
         return phi
 
+    def _gradient_guided_correction(
+        self,
+        phi: torch.Tensor,
+        phase_clean: torch.Tensor,
+        coh_weights: torch.Tensor,
+        nan_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """
+        Correct 2π branch cut errors via quality-guided graph integration.
+
+        Instead of relying on the congruence projection k values (which may
+        have branch cut routing errors), this method integrates the wrapped
+        phase gradients from the seed pixel along a Dijkstra shortest-path
+        tree weighted by inverse coherence. This routes branch cuts through
+        low-coherence areas (similar to SNAPHU's MCF approach).
+
+        Uses scipy's C-compiled Dijkstra for the traversal order, then
+        propagates k values along the tree in a single pass.
+
+        Parameters
+        ----------
+        phi : torch.Tensor
+            Congruent unwrapped phase (H, W).
+        phase_clean : torch.Tensor
+            Wrapped phase with NaN replaced by 0 (H, W).
+        coh_weights : torch.Tensor
+            Coherence-derived weights (H, W), 0 at invalid pixels.
+        nan_mask : torch.Tensor or None
+            Boolean mask of invalid pixels.
+
+        Returns
+        -------
+        torch.Tensor
+            Corrected unwrapped phase.
+        """
+        from scipy.sparse import csr_matrix
+        from scipy.sparse.csgraph import dijkstra
+
+        H, W = phi.shape
+        device = phi.device
+        two_pi = 2 * math.pi
+        n_pixels = H * W
+
+        # Move to CPU numpy
+        psi = phase_clean.detach().cpu().numpy()
+        coh = coh_weights.detach().cpu().numpy()
+        nan_np = (
+            nan_mask.detach().cpu().numpy()
+            if nan_mask is not None
+            else np.zeros((H, W), dtype=bool)
+        )
+        valid = ~nan_np
+
+        # Wrapping integers between adjacent pixels
+        # k[j+1] = k[j] + m_x[j]  means gradient-consistent unwrapping
+        raw_dx = psi[:, 1:] - psi[:, :-1]
+        m_x = -np.rint(raw_dx / two_pi).astype(np.int64)
+        raw_dy = psi[1:, :] - psi[:-1, :]
+        m_y = -np.rint(raw_dy / two_pi).astype(np.int64)
+
+        # Seed: highest-coherence valid pixel
+        phi_np = phi.detach().cpu().numpy()
+        coh_masked = np.where(valid, coh, -1.0)
+        seed_idx = int(np.argmax(coh_masked))
+        seed_r, seed_c = seed_idx // W, seed_idx % W
+        seed_flat = seed_r * W + seed_c
+        seed_k = int(np.round(
+            (phi_np[seed_r, seed_c] - psi[seed_r, seed_c]) / two_pi
+        ))
+
+        # Build sparse grid graph weighted by INVERSE coherence
+        # Low cost = high coherence, so Dijkstra routes through high-coh areas
+        # and branch cuts end up in low-coherence regions.
+        # Horizontal edges: (i,j) <-> (i,j+1)
+        h_valid = valid[:, :-1] & valid[:, 1:]
+        hr, hc = np.where(h_valid)
+        idx_l = hr * W + hc
+        idx_r = hr * W + (hc + 1)
+        min_coh_h = np.minimum(coh[hr, hc], coh[hr, hc + 1])
+        cost_h = 1.0 / (min_coh_h + 1e-6)
+
+        # Vertical edges: (i,j) <-> (i+1,j)
+        v_valid = valid[:-1, :] & valid[1:, :]
+        vr, vc = np.where(v_valid)
+        idx_t = vr * W + vc
+        idx_b = (vr + 1) * W + vc
+        min_coh_v = np.minimum(coh[vr, vc], coh[vr + 1, vc])
+        cost_v = 1.0 / (min_coh_v + 1e-6)
+
+        # Symmetric adjacency
+        rows = np.concatenate([idx_l, idx_r, idx_t, idx_b])
+        cols = np.concatenate([idx_r, idx_l, idx_b, idx_t])
+        costs = np.concatenate([cost_h, cost_h, cost_v, cost_v])
+
+        graph = csr_matrix(
+            (costs, (rows, cols)), shape=(n_pixels, n_pixels)
+        )
+
+        # Dijkstra from seed — quality-guided traversal (scipy C-compiled)
+        dist, predecessors = dijkstra(
+            graph, indices=seed_flat, return_predecessors=True
+        )
+
+        # Sort by distance = Dijkstra visitation order (high-coh pixels first)
+        order = np.argsort(dist)
+        # Keep only reachable valid pixels (finite distance), skip seed
+        reachable = np.isfinite(dist[order]) & (order != seed_flat)
+        pixels = order[reachable]
+        preds = predecessors[pixels]
+
+        r_pix = pixels // W
+        c_pix = pixels % W
+        r_par = preds // W
+        c_par = preds % W
+
+        m_inc = np.zeros(len(pixels), dtype=np.int64)
+
+        # From left parent (r, c-1) -> pixel (r, c)
+        mask = (r_pix == r_par) & (c_pix == c_par + 1)
+        m_inc[mask] = m_x[r_pix[mask], c_par[mask]]
+
+        # From right parent (r, c+1) -> pixel (r, c)
+        mask = (r_pix == r_par) & (c_pix == c_par - 1)
+        m_inc[mask] = -m_x[r_pix[mask], c_pix[mask]]
+
+        # From above parent (r-1, c) -> pixel (r, c)
+        mask = (r_pix == r_par + 1) & (c_pix == c_par)
+        m_inc[mask] = m_y[r_par[mask], c_pix[mask]]
+
+        # From below parent (r+1, c) -> pixel (r, c)
+        mask = (r_pix == r_par - 1) & (c_pix == c_par)
+        m_inc[mask] = -m_y[r_pix[mask], c_pix[mask]]
+
+        # Propagate k along BFS tree order (single sequential pass)
+        # Each pixel's parent was visited earlier, so flat_k[parent] is set.
+        flat_k = np.zeros(n_pixels, dtype=np.int64)
+        flat_k[seed_flat] = seed_k
+
+        for i in range(len(pixels)):
+            flat_k[pixels[i]] = flat_k[preds[i]] + m_inc[i]
+
+        k = flat_k.reshape(H, W)
+
+        # Reconstruct corrected phase
+        k_tensor = torch.from_numpy(k.astype(np.float64)).to(
+            dtype=phi.dtype, device=device
+        )
+        return phase_clean + k_tensor * two_pi
+
     def _cg_solve(
         self,
         phi_init: torch.Tensor,
         grad_x_target: torch.Tensor,
         grad_y_target: torch.Tensor,
-        weights: torch.Tensor,
+        weights_x: torch.Tensor,
+        weights_y: torch.Tensor,
         max_iterations: int,
     ) -> torch.Tensor:
         """
         Solve weighted least squares using Conjugate Gradient.
 
-        Solves: min Σ w_ij * |∇φ_ij - g_ij|²
+        Solves: min Σ w_x_ij * |∂xφ_ij - gx_ij|² + w_y_ij * |∂yφ_ij - gy_ij|²
 
         This is equivalent to solving the weighted Poisson equation:
-            div(w * ∇φ) = div(w * g)
+            div(W * ∇φ) = div(W * g)
+
+        with separate weights W_x, W_y for horizontal and vertical edges.
 
         Parameters
         ----------
@@ -232,8 +406,8 @@ class IRLSCGUnwrapper(BaseUnwrapper):
             Initial guess for φ.
         grad_x_target, grad_y_target : torch.Tensor
             Target gradients.
-        weights : torch.Tensor
-            Pixel weights.
+        weights_x, weights_y : torch.Tensor
+            Per-edge weights for horizontal and vertical gradients.
         max_iterations : int
             Maximum CG iterations.
 
@@ -244,12 +418,12 @@ class IRLSCGUnwrapper(BaseUnwrapper):
         """
         phi = phi_init.clone()
 
-        # Compute RHS: div(w * g)
+        # Compute RHS: div(W * g)
         # Using backward difference for divergence (adjoint of forward gradient)
-        rhs = self._weighted_divergence(grad_x_target, grad_y_target, weights)
+        rhs = self._weighted_divergence(grad_x_target, grad_y_target, weights_x, weights_y)
 
         # Initial residual: r = b - A*x
-        Aphi = self._weighted_laplacian(phi, weights)
+        Aphi = self._weighted_laplacian(phi, weights_x, weights_y)
         r = rhs - Aphi
 
         # Initial search direction
@@ -261,7 +435,7 @@ class IRLSCGUnwrapper(BaseUnwrapper):
 
         for cg_iter in range(max_iterations):
             # Matrix-vector product: A*p
-            Ap = self._weighted_laplacian(p, weights)
+            Ap = self._weighted_laplacian(p, weights_x, weights_y)
 
             # Step size
             pAp = torch.sum(p * Ap)
@@ -291,12 +465,14 @@ class IRLSCGUnwrapper(BaseUnwrapper):
     def _weighted_laplacian(
         self,
         phi: torch.Tensor,
-        weights: torch.Tensor,
+        weights_x: torch.Tensor,
+        weights_y: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Compute weighted Laplacian: -div(w * ∇φ).
+        Compute weighted Laplacian: -div(W * ∇φ) with per-edge weights.
 
         This is the operator A in the linear system A*φ = b.
+        Uses weights_x for horizontal edges and weights_y for vertical edges.
         """
         H, W = phi.shape
 
@@ -306,9 +482,9 @@ class IRLSCGUnwrapper(BaseUnwrapper):
         grad_x[:, :-1] = phi[:, 1:] - phi[:, :-1]
         grad_y[:-1, :] = phi[1:, :] - phi[:-1, :]
 
-        # Weight the gradients
-        wgrad_x = weights * grad_x
-        wgrad_y = weights * grad_y
+        # Weight each edge direction independently
+        wgrad_x = weights_x * grad_x
+        wgrad_y = weights_y * grad_y
 
         # Backward divergence (negative adjoint of forward gradient)
         div = torch.zeros_like(phi)
@@ -325,18 +501,19 @@ class IRLSCGUnwrapper(BaseUnwrapper):
         self,
         grad_x: torch.Tensor,
         grad_y: torch.Tensor,
-        weights: torch.Tensor,
+        weights_x: torch.Tensor,
+        weights_y: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Compute weighted divergence: div(w * g).
+        Compute weighted divergence: div(W * g) with per-edge weights.
 
         This is the RHS b in the linear system.
         """
         H, W = grad_x.shape
 
-        # Weight the gradients
-        wgrad_x = weights * grad_x
-        wgrad_y = weights * grad_y
+        # Weight each gradient component with its own weight
+        wgrad_x = weights_x * grad_x
+        wgrad_y = weights_y * grad_y
 
         # Backward divergence
         div = torch.zeros_like(grad_x)
