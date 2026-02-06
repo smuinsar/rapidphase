@@ -96,6 +96,7 @@ def unwrap(
     n_gpus: int | None = None,
     max_iterations: int = 50,
     tolerance: float = 1e-4,
+    delta: float = 0.1,
     release_memory: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
@@ -139,6 +140,10 @@ def unwrap(
         Maximum IRLS iterations (default 50, only for algorithm="irls").
     tolerance : float
         IRLS convergence tolerance (default 1e-4).
+    delta : float
+        Smoothing parameter for IRLS-CG weights. Smaller values approximate
+        L1 more closely but may cause instability. Only used when
+        algorithm="irls_cg" (default 0.1).
     release_memory : bool
         If True, clear GPU memory cache after processing (default False).
         This is useful when using rapidphase alongside other GPU frameworks
@@ -196,12 +201,19 @@ def unwrap(
 
     # Select algorithm
     if algorithm == "auto":
-        algorithm = "irls" if coherence is not None else "dct"
+        algorithm = "irls_cg" if coherence is not None else "dct"
 
     # Create unwrapper
     if algorithm == "dct":
         unwrapper = DCTUnwrapper(dm)
     elif algorithm == "irls":
+        import warnings
+        warnings.warn(
+            'algorithm="irls" is deprecated. Use "irls_cg" instead, '
+            'which provides better convergence and SNAPHU-comparable results.',
+            DeprecationWarning,
+            stacklevel=2,
+        )
         unwrapper = IRLSUnwrapper(
             dm,
             max_iterations=max_iterations,
@@ -214,6 +226,7 @@ def unwrap(
             max_irls_iterations=max_iterations,
             irls_tolerance=tolerance,
             nlooks=nlooks,
+            delta=delta,
         )
     else:
         raise ValueError(f"Unknown algorithm: {algorithm}")
@@ -258,6 +271,7 @@ def unwrap(
                     max_irls_iterations=max_iterations,
                     irls_tolerance=tolerance,
                     nlooks=nlooks,
+                    delta=delta,
                 )
 
         # Use numpy-based tiling to avoid loading entire image to GPU
@@ -402,7 +416,7 @@ def unwrap_irls_cg(
     corr: np.ndarray | None = None,
     nlooks: float = 1.0,
     device: DeviceType = "auto",
-    max_iterations: int = 20,
+    max_iterations: int = 50,
     tolerance: float = 1e-4,
     delta: float = 0.1,
     ntiles: tuple[int, int] | None = None,
@@ -426,7 +440,7 @@ def unwrap_irls_cg(
     device : str
         Compute device: "cuda", "mps", "cpu", or "auto".
     max_iterations : int
-        Maximum IRLS iterations (default 20).
+        Maximum IRLS iterations (default 50).
     tolerance : float
         Convergence tolerance.
     delta : float
@@ -458,6 +472,7 @@ def unwrap_irls_cg(
         device=device,
         max_iterations=max_iterations,
         tolerance=tolerance,
+        delta=delta,
         ntiles=ntiles,
         tile_overlap=tile_overlap,
     )

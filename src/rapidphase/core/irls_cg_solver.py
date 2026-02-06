@@ -20,6 +20,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import heapq
+import math
+
+import numpy as np
 import torch
 
 from rapidphase.core.base import BaseUnwrapper
@@ -47,8 +51,8 @@ class IRLSCGUnwrapper(BaseUnwrapper):
     def __init__(
         self,
         device_manager: DeviceManager,
-        max_irls_iterations: int = 20,
-        max_cg_iterations: int = 100,
+        max_irls_iterations: int = 50,
+        max_cg_iterations: int = 200,
         irls_tolerance: float = 1e-4,
         cg_tolerance: float = 1e-6,
         delta: float = 0.1,
@@ -167,23 +171,28 @@ class IRLSCGUnwrapper(BaseUnwrapper):
             res_x = grad_x_phi - grad_x_target
             res_y = grad_y_phi - grad_y_target
 
-            # Update IRLS weights: w = C / max(|residual|, delta)
-            residual_mag = torch.sqrt(res_x ** 2 + res_y ** 2 + 1e-10)
-            irls_weights = coh_weights / torch.clamp(residual_mag, min=self.delta)
+            # Update IRLS weights per-edge: w = C / max(|residual|, delta)
+            # Separate weights for horizontal (x) and vertical (y) edges
+            irls_weights_x = coh_weights / torch.clamp(torch.abs(res_x) + 1e-10, min=self.delta)
+            irls_weights_y = coh_weights / torch.clamp(torch.abs(res_y) + 1e-10, min=self.delta)
 
-            # Normalize weights for numerical stability
-            irls_weights = irls_weights / (irls_weights.max() + 1e-10)
+            # Normalize weights for numerical stability (shared scale)
+            max_w = max(irls_weights_x.max(), irls_weights_y.max()) + 1e-10
+            irls_weights_x = irls_weights_x / max_w
+            irls_weights_y = irls_weights_y / max_w
 
             # Set weights to 0 for NaN pixels
             if has_nans:
-                irls_weights[nan_mask] = 0.0
+                irls_weights_x[nan_mask] = 0.0
+                irls_weights_y[nan_mask] = 0.0
 
             # Solve weighted least squares using CG
             phi = self._cg_solve(
                 phi,
                 grad_x_target,
                 grad_y_target,
-                irls_weights,
+                irls_weights_x,
+                irls_weights_y,
                 max_cg,
             )
 
@@ -204,27 +213,148 @@ class IRLSCGUnwrapper(BaseUnwrapper):
             if rel_change < self.irls_tolerance:
                 break
 
+        # Project to nearest congruent solution:
+        # unwrapped = wrapped + k * 2*pi, where k is the nearest integer
+        k = torch.round((phi - phase_clean) / (2 * math.pi))
+        phi = phase_clean + k * (2 * math.pi)
+
+        # Correct branch cut routing via quality-guided flood fill.
+        # The DCT initialization may route branch cuts differently from
+        # optimal (MCF-style) routing. This BFS correction grows outward
+        # from the highest-coherence pixel, adjusting each pixel's integer
+        # cycle to be gradient-consistent with already-visited neighbors.
+        phi = self._gradient_guided_correction(
+            phi, phase_clean, coh_weights, nan_mask if has_nans else None
+        )
+
         # Restore NaN at invalid pixel locations
         if has_nans:
             phi[nan_mask] = float('nan')
 
         return phi
 
+    def _gradient_guided_correction(
+        self,
+        phi: torch.Tensor,
+        phase_clean: torch.Tensor,
+        coh_weights: torch.Tensor,
+        nan_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """
+        Correct 2π branch cut errors via quality-guided flood fill.
+
+        After congruence projection, the integer cycle map k (where
+        phi = phase_clean + k * 2π) may have incorrect jumps due to
+        branch cut routing differences from the DCT initialization.
+
+        This method grows outward from the highest-coherence pixel via
+        a priority queue (Dijkstra-like), adjusting each pixel's k to be
+        gradient-consistent with its already-visited neighbor.
+
+        Parameters
+        ----------
+        phi : torch.Tensor
+            Congruent unwrapped phase (H, W).
+        phase_clean : torch.Tensor
+            Wrapped phase with NaN replaced by 0 (H, W).
+        coh_weights : torch.Tensor
+            Coherence-derived weights (H, W), 0 at invalid pixels.
+        nan_mask : torch.Tensor or None
+            Boolean mask of invalid pixels.
+
+        Returns
+        -------
+        torch.Tensor
+            Corrected unwrapped phase.
+        """
+        H, W = phi.shape
+        device = phi.device
+
+        # Move to CPU numpy for BFS
+        psi = phase_clean.detach().cpu().numpy()
+        coh = coh_weights.detach().cpu().numpy()
+        nan_np = nan_mask.detach().cpu().numpy() if nan_mask is not None else np.zeros((H, W), dtype=bool)
+
+        # Integer cycle map: phi = psi + k * 2π
+        k_orig = np.round((phi.detach().cpu().numpy() - psi) / (2 * math.pi)).astype(np.int32)
+        k_out = k_orig.copy()
+
+        # Precompute wrapped gradients between adjacent pixels
+        # Horizontal: wrap(psi[i,j+1] - psi[i,j]), shape (H, W-1)
+        dx = psi[:, 1:] - psi[:, :-1]
+        wdiff_x = np.arctan2(np.sin(dx), np.cos(dx))
+        # Vertical: wrap(psi[i+1,j] - psi[i,j]), shape (H-1, W)
+        dy = psi[1:, :] - psi[:-1, :]
+        wdiff_y = np.arctan2(np.sin(dy), np.cos(dy))
+
+        # Find seed: highest-coherence valid pixel
+        coh_masked = coh.copy()
+        coh_masked[nan_np] = -1.0
+        flat_idx = int(np.argmax(coh_masked))
+        seed_r, seed_c = flat_idx // W, flat_idx % W
+
+        # Quality-guided BFS via max-coherence priority queue
+        visited = np.zeros((H, W), dtype=bool)
+        visited[seed_r, seed_c] = True
+        # Python heapq is min-heap, negate coherence for max-first
+        heap = [(-coh[seed_r, seed_c], seed_r, seed_c)]
+
+        two_pi = 2 * math.pi
+
+        while heap:
+            _, r, c = heapq.heappop(heap)
+
+            # Visit 4-connected neighbors
+            # Right: (r, c+1) — use wdiff_x[r, c]
+            if c + 1 < W and not visited[r, c + 1] and not nan_np[r, c + 1]:
+                visited[r, c + 1] = True
+                expected = psi[r, c] + k_out[r, c] * two_pi + wdiff_x[r, c]
+                k_out[r, c + 1] = round((expected - psi[r, c + 1]) / two_pi)
+                heapq.heappush(heap, (-coh[r, c + 1], r, c + 1))
+
+            # Left: (r, c-1) — use -wdiff_x[r, c-1]
+            if c - 1 >= 0 and not visited[r, c - 1] and not nan_np[r, c - 1]:
+                visited[r, c - 1] = True
+                expected = psi[r, c] + k_out[r, c] * two_pi - wdiff_x[r, c - 1]
+                k_out[r, c - 1] = round((expected - psi[r, c - 1]) / two_pi)
+                heapq.heappush(heap, (-coh[r, c - 1], r, c - 1))
+
+            # Down: (r+1, c) — use wdiff_y[r, c]
+            if r + 1 < H and not visited[r + 1, c] and not nan_np[r + 1, c]:
+                visited[r + 1, c] = True
+                expected = psi[r, c] + k_out[r, c] * two_pi + wdiff_y[r, c]
+                k_out[r + 1, c] = round((expected - psi[r + 1, c]) / two_pi)
+                heapq.heappush(heap, (-coh[r + 1, c], r + 1, c))
+
+            # Up: (r-1, c) — use -wdiff_y[r-1, c]
+            if r - 1 >= 0 and not visited[r - 1, c] and not nan_np[r - 1, c]:
+                visited[r - 1, c] = True
+                expected = psi[r, c] + k_out[r, c] * two_pi - wdiff_y[r - 1, c]
+                k_out[r - 1, c] = round((expected - psi[r - 1, c]) / two_pi)
+                heapq.heappush(heap, (-coh[r - 1, c], r - 1, c))
+
+        # Reconstruct corrected phase
+        k_tensor = torch.from_numpy(k_out.astype(np.float64)).to(dtype=phi.dtype, device=device)
+        return phase_clean + k_tensor * two_pi
+
     def _cg_solve(
         self,
         phi_init: torch.Tensor,
         grad_x_target: torch.Tensor,
         grad_y_target: torch.Tensor,
-        weights: torch.Tensor,
+        weights_x: torch.Tensor,
+        weights_y: torch.Tensor,
         max_iterations: int,
     ) -> torch.Tensor:
         """
         Solve weighted least squares using Conjugate Gradient.
 
-        Solves: min Σ w_ij * |∇φ_ij - g_ij|²
+        Solves: min Σ w_x_ij * |∂xφ_ij - gx_ij|² + w_y_ij * |∂yφ_ij - gy_ij|²
 
         This is equivalent to solving the weighted Poisson equation:
-            div(w * ∇φ) = div(w * g)
+            div(W * ∇φ) = div(W * g)
+
+        with separate weights W_x, W_y for horizontal and vertical edges.
 
         Parameters
         ----------
@@ -232,8 +362,8 @@ class IRLSCGUnwrapper(BaseUnwrapper):
             Initial guess for φ.
         grad_x_target, grad_y_target : torch.Tensor
             Target gradients.
-        weights : torch.Tensor
-            Pixel weights.
+        weights_x, weights_y : torch.Tensor
+            Per-edge weights for horizontal and vertical gradients.
         max_iterations : int
             Maximum CG iterations.
 
@@ -244,12 +374,12 @@ class IRLSCGUnwrapper(BaseUnwrapper):
         """
         phi = phi_init.clone()
 
-        # Compute RHS: div(w * g)
+        # Compute RHS: div(W * g)
         # Using backward difference for divergence (adjoint of forward gradient)
-        rhs = self._weighted_divergence(grad_x_target, grad_y_target, weights)
+        rhs = self._weighted_divergence(grad_x_target, grad_y_target, weights_x, weights_y)
 
         # Initial residual: r = b - A*x
-        Aphi = self._weighted_laplacian(phi, weights)
+        Aphi = self._weighted_laplacian(phi, weights_x, weights_y)
         r = rhs - Aphi
 
         # Initial search direction
@@ -261,7 +391,7 @@ class IRLSCGUnwrapper(BaseUnwrapper):
 
         for cg_iter in range(max_iterations):
             # Matrix-vector product: A*p
-            Ap = self._weighted_laplacian(p, weights)
+            Ap = self._weighted_laplacian(p, weights_x, weights_y)
 
             # Step size
             pAp = torch.sum(p * Ap)
@@ -291,12 +421,14 @@ class IRLSCGUnwrapper(BaseUnwrapper):
     def _weighted_laplacian(
         self,
         phi: torch.Tensor,
-        weights: torch.Tensor,
+        weights_x: torch.Tensor,
+        weights_y: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Compute weighted Laplacian: -div(w * ∇φ).
+        Compute weighted Laplacian: -div(W * ∇φ) with per-edge weights.
 
         This is the operator A in the linear system A*φ = b.
+        Uses weights_x for horizontal edges and weights_y for vertical edges.
         """
         H, W = phi.shape
 
@@ -306,9 +438,9 @@ class IRLSCGUnwrapper(BaseUnwrapper):
         grad_x[:, :-1] = phi[:, 1:] - phi[:, :-1]
         grad_y[:-1, :] = phi[1:, :] - phi[:-1, :]
 
-        # Weight the gradients
-        wgrad_x = weights * grad_x
-        wgrad_y = weights * grad_y
+        # Weight each edge direction independently
+        wgrad_x = weights_x * grad_x
+        wgrad_y = weights_y * grad_y
 
         # Backward divergence (negative adjoint of forward gradient)
         div = torch.zeros_like(phi)
@@ -325,18 +457,19 @@ class IRLSCGUnwrapper(BaseUnwrapper):
         self,
         grad_x: torch.Tensor,
         grad_y: torch.Tensor,
-        weights: torch.Tensor,
+        weights_x: torch.Tensor,
+        weights_y: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Compute weighted divergence: div(w * g).
+        Compute weighted divergence: div(W * g) with per-edge weights.
 
         This is the RHS b in the linear system.
         """
         H, W = grad_x.shape
 
-        # Weight the gradients
-        wgrad_x = weights * grad_x
-        wgrad_y = weights * grad_y
+        # Weight each gradient component with its own weight
+        wgrad_x = weights_x * grad_x
+        wgrad_y = weights_y * grad_y
 
         # Backward divergence
         div = torch.zeros_like(grad_x)
