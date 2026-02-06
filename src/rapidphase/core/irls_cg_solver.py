@@ -152,9 +152,17 @@ class IRLSCGUnwrapper(BaseUnwrapper):
         else:
             coh_weights = self.dm.ones((H, W))
 
-        # Set weights to 0 for NaN pixels
+        # Set weights to 0 for NaN pixels AND NaN edges.
+        # An edge (i,j)->(i,j+1) must have zero weight if either pixel is NaN.
+        # This ensures the weighted Laplacian operator (A) and the RHS (b) are
+        # consistent — otherwise CG diverges on large mostly-NaN tiles.
         if has_nans:
             coh_weights[nan_mask] = 0.0
+            # Also precompute NaN edge masks for per-edge weight zeroing
+            nan_edge_x = nan_mask.clone()
+            nan_edge_x[:, :-1] = nan_edge_x[:, :-1] | nan_mask[:, 1:]
+            nan_edge_y = nan_mask.clone()
+            nan_edge_y[:-1, :] = nan_edge_y[:-1, :] | nan_mask[1:, :]
 
         # Initialize with DCT solution
         phi = self._dct_solver.unwrap(phase_clean, nan_mask=nan_mask)
@@ -195,10 +203,10 @@ class IRLSCGUnwrapper(BaseUnwrapper):
             irls_weights_x = irls_weights_x / max_w
             irls_weights_y = irls_weights_y / max_w
 
-            # Set weights to 0 for NaN pixels
+            # Set weights to 0 for NaN edges (either endpoint is NaN)
             if has_nans:
-                irls_weights_x[nan_mask] = 0.0
-                irls_weights_y[nan_mask] = 0.0
+                irls_weights_x[nan_edge_x] = 0.0
+                irls_weights_y[nan_edge_y] = 0.0
 
             # Solve weighted least squares using Preconditioned CG
             phi = self._cg_solve(
