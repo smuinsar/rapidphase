@@ -201,9 +201,15 @@ class TileManager:
         for tile, data in tiles_data:
             tile_dict[(tile.row_idx, tile.col_idx)] = (tile, data.clone())
 
+        # Pick reference tile: the one with the most valid (non-NaN) pixels
+        ref_idx = max(
+            tile_dict.keys(),
+            key=lambda idx: int((~torch.isnan(tile_dict[idx][1])).sum().item()),
+        )
+
         aligned = set()
-        offsets = {(0, 0): 0.0}
-        aligned.add((0, 0))
+        offsets = {ref_idx: 0.0}
+        aligned.add(ref_idx)
 
         pq: list[tuple[int, tuple[int, int], float]] = []
 
@@ -243,11 +249,18 @@ class TileManager:
                 n_valid = int(valid_mask.sum().item())
 
                 if n_valid > 0:
-                    raw_offset = torch.median(diff[valid_mask]).item()
-                    offset = round(raw_offset / two_pi) * two_pi
+                    # Per-pixel rounding + mode: robust to DC offset differences
+                    # between tiles. Each pixel's diff should be close to N*2pi,
+                    # so round per-pixel then take the most common integer.
+                    k_per_pixel = torch.round(diff[valid_mask] / two_pi).long()
+                    k_min = k_per_pixel.min().item()
+                    k_shifted = k_per_pixel - k_min
+                    counts = torch.bincount(k_shifted)
+                    k_mode = int(counts.argmax().item()) + k_min
+                    offset = k_mode * two_pi
                     heapq.heappush(pq, (-n_valid, neighbor_idx, offset))
 
-        add_neighbors((0, 0))
+        add_neighbors(ref_idx)
 
         while pq:
             neg_nvalid, neighbor_idx, offset = heapq.heappop(pq)
@@ -780,10 +793,18 @@ class TileManager:
         n_valid = int(valid_mask.sum())
 
         if n_valid > 0:
-            # Round offset to nearest 2*pi multiple for phase unwrapping
-            # (tile offsets should always be integer multiples of 2*pi)
-            raw_offset = float(np.median(diff[valid_mask]))
-            offset = round(raw_offset / (2 * np.pi)) * (2 * np.pi)
+            # Per-pixel rounding + mode: each pixel's diff should be close
+            # to N*2pi (since both tiles are congruent solutions). Round
+            # per-pixel to get the integer k, then take the mode (most
+            # common value). This is robust to DC offset differences between
+            # tiles that can cause median-based rounding to fail.
+            two_pi = 2 * np.pi
+            k_per_pixel = np.round(diff[valid_mask] / two_pi).astype(np.int64)
+            k_min = int(k_per_pixel.min())
+            k_shifted = k_per_pixel - k_min
+            counts = np.bincount(k_shifted)
+            k_mode = int(np.argmax(counts)) + k_min
+            offset = k_mode * two_pi
             return offset, n_valid
         else:
             return 0.0, 0
@@ -812,13 +833,19 @@ class TileManager:
         for tile, data in tiles_data:
             tile_dict[(tile.row_idx, tile.col_idx)] = (tile, data.copy())
 
+        # Pick reference tile: the one with the most valid (non-NaN) pixels.
+        # Starting BFS from a mostly-NaN tile gives unreliable offsets.
+        ref_idx = max(
+            tile_dict.keys(),
+            key=lambda idx: int(np.sum(~np.isnan(tile_dict[idx][1]))),
+        )
+
         # Track which tiles have been aligned
         aligned = set()
-        offsets = {(0, 0): 0.0}  # First tile is reference
-        aligned.add((0, 0))
+        offsets = {ref_idx: 0.0}  # Reference tile has zero offset
+        aligned.add(ref_idx)
 
         # Priority queue: (negative n_valid for max-first, neighbor_idx, offset)
-        # Start by evaluating all neighbors of (0,0)
         import heapq
         pq: list[tuple[int, tuple[int, int], float]] = []
 
@@ -844,7 +871,7 @@ class TileManager:
                     # Use negative n_valid so heapq gives us the largest first
                     heapq.heappush(pq, (-n_valid, neighbor_idx, offset))
 
-        add_neighbors((0, 0))
+        add_neighbors(ref_idx)
 
         while pq:
             neg_nvalid, neighbor_idx, offset = heapq.heappop(pq)
