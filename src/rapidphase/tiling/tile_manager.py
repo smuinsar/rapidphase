@@ -799,30 +799,42 @@ class TileManager:
                 oh = overlap_row_end - overlap_row_start
                 ow = overlap_col_end - overlap_col_start
 
-                # Sample a thin strip at the CENTER of the overlap in the
-                # narrow direction (perpendicular to tile boundary). This
-                # avoids internal 2π transitions that may occur at different
-                # positions in the two tiles, which would split the k votes.
-                # Use most of the extent in the long direction for statistics.
-                strip_half = 10  # ±10 pixels around center
+                # Sample a thin strip at the DATA BOUNDARY — the exact
+                # row/column where the hard stitch will happen. This ensures
+                # the k value we measure is what matters for visual continuity
+                # at the stitch, not some interior point where the tiles may
+                # have 2π transitions at different positions.
+                strip_half = 10  # ±10 pixels around boundary
                 margin_frac = 0.1  # skip 10% margins in long direction
 
-                if oh < ow:
-                    # Vertical neighbor: overlap is short (rows) and wide (cols)
-                    center_r = overlap_row_start + oh // 2
-                    cr0 = max(overlap_row_start, center_r - strip_half)
-                    cr1 = min(overlap_row_end, center_r + strip_half)
-                    margin_w = int(ow * margin_frac)
-                    cc0 = overlap_col_start + margin_w
-                    cc1 = overlap_col_end - margin_w
-                else:
-                    # Horizontal neighbor: overlap is tall (rows) and narrow (cols)
+                # Determine the stitch boundary position
+                # For horizontal neighbors: stitch at the shared data column edge
+                # For vertical neighbors: stitch at the shared data row edge
+                dr = neighbor_idx[0] - curr_idx[0]
+                dc = neighbor_idx[1] - curr_idx[1]
+
+                if dc != 0:
+                    # Horizontal neighbor: stitch at a column boundary
+                    if dc > 0:
+                        stitch_col = curr_tile.data_col_end  # right edge of curr
+                    else:
+                        stitch_col = curr_tile.data_col_start  # left edge of curr
+                    cc0 = max(overlap_col_start, stitch_col - strip_half)
+                    cc1 = min(overlap_col_end, stitch_col + strip_half)
                     margin_h = int(oh * margin_frac)
                     cr0 = overlap_row_start + margin_h
                     cr1 = overlap_row_end - margin_h
-                    center_c = overlap_col_start + ow // 2
-                    cc0 = max(overlap_col_start, center_c - strip_half)
-                    cc1 = min(overlap_col_end, center_c + strip_half)
+                else:
+                    # Vertical neighbor: stitch at a row boundary
+                    if dr > 0:
+                        stitch_row = curr_tile.data_row_end  # bottom edge of curr
+                    else:
+                        stitch_row = curr_tile.data_row_start  # top edge of curr
+                    cr0 = max(overlap_row_start, stitch_row - strip_half)
+                    cr1 = min(overlap_row_end, stitch_row + strip_half)
+                    margin_w = int(ow * margin_frac)
+                    cc0 = overlap_col_start + margin_w
+                    cc1 = overlap_col_end - margin_w
 
                 if cr0 >= cr1:
                     cr0, cr1 = overlap_row_start, overlap_row_end
