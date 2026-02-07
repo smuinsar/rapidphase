@@ -608,7 +608,13 @@ class TileManager:
                 nan_mask_tile_t = self.dm.to_tensor(nan_mask_tile_np.astype(np.float32)) > 0.5
 
             # Process tile on GPU
-            result_t = unwrapper.unwrap(tile_data_t, coh_tile_t, nan_mask=nan_mask_tile_t)
+            # For tiled processing, get continuous (pre-congruence) solution.
+            # Congruence projection is applied after merging to avoid per-tile
+            # 2pi transition inconsistencies at tile boundaries.
+            result_t = unwrapper.unwrap(
+                tile_data_t, coh_tile_t, nan_mask=nan_mask_tile_t,
+                return_continuous=True,
+            )
 
             # Move result back to CPU numpy and store
             result_np = self.dm.to_numpy(result_t)
@@ -623,8 +629,12 @@ class TileManager:
         if verbose and not HAS_TQDM:
             print("  Merging tiles with phase alignment...")
 
-        # Merge results with phase alignment (entirely on CPU using numpy)
-        result = self._merge_tiles_numpy(processed_tiles_np, (H, W), verbose=verbose)
+        # Merge continuous solutions, then apply congruence projection on
+        # the full merged result for globally consistent 2pi transitions.
+        result = self._merge_tiles_numpy(
+            processed_tiles_np, (H, W), verbose=verbose,
+            wrapped_phase=image, coherence=coherence, nan_mask=nan_mask,
+        )
 
         if verbose and not HAS_TQDM:
             print("  Done.")
@@ -699,7 +709,11 @@ class TileManager:
                     nan_mask_tile_t = dm.to_tensor(nan_mask_tile_np.astype(np.float32)) > 0.5
 
                 # Process tile using the GPU-specific unwrapper
-                result_t = unwrapper.unwrap(tile_data_t, coh_tile_t, nan_mask=nan_mask_tile_t)
+                # Return continuous solution for global congruence projection
+                result_t = unwrapper.unwrap(
+                    tile_data_t, coh_tile_t, nan_mask=nan_mask_tile_t,
+                    return_continuous=True,
+                )
 
                 # Move result back to CPU
                 result_np = dm.to_numpy(result_t)
@@ -740,8 +754,11 @@ class TileManager:
         if verbose:
             print("Aligning tile phases...")
 
-        # Merge results
-        result = self._merge_tiles_numpy(processed_tiles_np, (H, W), verbose=False)
+        # Merge continuous solutions, then apply congruence projection
+        result = self._merge_tiles_numpy(
+            processed_tiles_np, (H, W), verbose=False,
+            wrapped_phase=image, coherence=coherence, nan_mask=nan_mask,
+        )
 
         if verbose and not HAS_TQDM:
             print("  Done.")
@@ -755,12 +772,16 @@ class TileManager:
         curr_offset: float,
         neighbor_tile: TileInfo,
         neighbor_data: np.ndarray,
+        is_continuous: bool = False,
     ) -> tuple[float, int]:
         """
         Compute phase offset between two overlapping tiles.
 
-        Uses the full overlap region (no center-margin cropping) since NaN-heavy
-        tiles may only have valid pixels near edges.
+        For continuous solutions (pre-congruence), uses median of the
+        difference — no rounding needed since DC offset is arbitrary.
+
+        For congruent solutions, uses per-pixel rounding + mode to find
+        the correct integer multiple of 2π.
 
         Returns
         -------
@@ -793,18 +814,20 @@ class TileManager:
         n_valid = int(valid_mask.sum())
 
         if n_valid > 0:
-            # Per-pixel rounding + mode: each pixel's diff should be close
-            # to N*2pi (since both tiles are congruent solutions). Round
-            # per-pixel to get the integer k, then take the mode (most
-            # common value). This is robust to DC offset differences between
-            # tiles that can cause median-based rounding to fail.
-            two_pi = 2 * np.pi
-            k_per_pixel = np.round(diff[valid_mask] / two_pi).astype(np.int64)
-            k_min = int(k_per_pixel.min())
-            k_shifted = k_per_pixel - k_min
-            counts = np.bincount(k_shifted)
-            k_mode = int(np.argmax(counts)) + k_min
-            offset = k_mode * two_pi
+            if is_continuous:
+                # Continuous solutions differ by an arbitrary DC offset.
+                # Median gives a robust estimate of this constant offset.
+                offset = float(np.median(diff[valid_mask]))
+            else:
+                # Congruent solutions differ by integer multiples of 2π.
+                # Per-pixel rounding + mode is robust to local disagreements.
+                two_pi = 2 * np.pi
+                k_per_pixel = np.round(diff[valid_mask] / two_pi).astype(np.int64)
+                k_min = int(k_per_pixel.min())
+                k_shifted = k_per_pixel - k_min
+                counts = np.bincount(k_shifted)
+                k_mode = int(np.argmax(counts)) + k_min
+                offset = k_mode * two_pi
             return offset, n_valid
         else:
             return 0.0, 0
@@ -812,13 +835,13 @@ class TileManager:
     def _align_tile_phases_numpy(
         self,
         tiles_data: list[tuple[TileInfo, np.ndarray]],
+        is_continuous: bool = False,
     ) -> list[tuple[TileInfo, np.ndarray]]:
         """
         Align phase offsets between adjacent tiles (numpy/CPU version).
 
-        Each tile from phase unwrapping has an arbitrary constant offset
-        (integer multiple of 2*pi). This method computes and applies
-        corrections so tiles have consistent phase values.
+        For continuous solutions, aligns using median offset (arbitrary DC).
+        For congruent solutions, aligns using mode-based 2π rounding.
 
         Uses BFS with priority: tiles with more valid overlap pixels are
         aligned first to avoid propagating errors through NaN-heavy links.
@@ -866,6 +889,7 @@ class TileManager:
                 offset, n_valid = self._compute_overlap_offset_numpy(
                     curr_tile, curr_data, curr_offset,
                     neighbor_tile, neighbor_data,
+                    is_continuous=is_continuous,
                 )
                 if n_valid > 0:
                     # Use negative n_valid so heapq gives us the largest first
@@ -898,23 +922,32 @@ class TileManager:
         tiles_data: list[tuple[TileInfo, np.ndarray]],
         shape: tuple[int, int],
         verbose: bool = False,
+        wrapped_phase: np.ndarray | None = None,
+        coherence: np.ndarray | None = None,
+        nan_mask: np.ndarray | None = None,
     ) -> np.ndarray:
         """
         Merge processed tiles back into a full image (numpy/CPU version).
 
-        Memory-efficient implementation that keeps all data on CPU.
+        When wrapped_phase is provided, tiles are treated as continuous
+        (pre-congruence) solutions: aligned with median offset, merged with
+        blend weights, then congruence projection + local consistency
+        correction are applied on the full merged result.
 
         The blending strategy uses the DATA boundaries (not extended boundaries)
         to determine where feathering occurs. Each tile has full weight in the
         center of its data region and ramps down in the overlap regions.
         """
         H, W = shape
+        is_continuous = wrapped_phase is not None
 
         # Align phase offsets between tiles
         if len(tiles_data) > 1:
-            if verbose and HAS_TQDM:
+            if verbose:
                 print("Aligning tile phases...")
-            tiles_data = self._align_tile_phases_numpy(tiles_data)
+            tiles_data = self._align_tile_phases_numpy(
+                tiles_data, is_continuous=is_continuous
+            )
 
         # Accumulators for weighted average (CPU memory)
         result = np.zeros((H, W), dtype=np.float64)
@@ -983,7 +1016,169 @@ class TileManager:
         result[valid_output] = result[valid_output] / weight_sum[valid_output]
         result[~valid_output] = np.nan
 
+        # For continuous solutions, apply congruence projection on the full
+        # merged result. This ensures globally consistent 2π transitions
+        # instead of per-tile projections that can disagree at boundaries.
+        if is_continuous and wrapped_phase is not None:
+            if verbose:
+                print("Applying global congruence projection...")
+            result = self._apply_congruence_numpy(
+                result, wrapped_phase, coherence, nan_mask, verbose=verbose
+            )
+
         return result
+
+    def _apply_congruence_numpy(
+        self,
+        phi_continuous: np.ndarray,
+        wrapped_phase: np.ndarray,
+        coherence: np.ndarray | None,
+        nan_mask: np.ndarray | None,
+        verbose: bool = False,
+    ) -> np.ndarray:
+        """
+        Apply congruence projection and local consistency correction.
+
+        Projects the continuous solution to the nearest congruent solution
+        (wrapped_phase + k * 2π) and fixes local consistency errors.
+
+        Parameters
+        ----------
+        phi_continuous : np.ndarray
+            Merged continuous solution (H, W).
+        wrapped_phase : np.ndarray
+            Original wrapped phase (H, W).
+        coherence : np.ndarray or None
+            Coherence map for weighting consistency correction.
+        nan_mask : np.ndarray or None
+            Boolean mask of invalid pixels.
+        verbose : bool
+            Print progress information.
+
+        Returns
+        -------
+        np.ndarray
+            Congruent unwrapped phase.
+        """
+        two_pi = 2 * np.pi
+
+        # Handle NaN: replace with 0 for computation
+        if nan_mask is None:
+            nan_mask = np.isnan(wrapped_phase) | np.isnan(phi_continuous)
+        has_nans = np.any(nan_mask)
+
+        phase_clean = wrapped_phase.copy()
+        phi_cont_clean = phi_continuous.copy()
+        if has_nans:
+            phase_clean[nan_mask] = 0.0
+            phi_cont_clean[nan_mask] = 0.0
+
+        # DC offset adjustment: center fractional parts away from ±0.5
+        k_float = (phi_cont_clean - phase_clean) / two_pi
+        frac = k_float - np.round(k_float)
+        if has_nans:
+            valid_frac = frac[~nan_mask]
+            dc_adjust = float(np.median(valid_frac)) * two_pi if valid_frac.size > 0 else 0.0
+        else:
+            dc_adjust = float(np.median(frac)) * two_pi
+        phi_cont_clean = phi_cont_clean - dc_adjust
+
+        # Congruence projection: k = round((phi - psi) / 2π)
+        k = np.round((phi_cont_clean - phase_clean) / two_pi)
+        result = phase_clean + k * two_pi
+
+        # Coherence weights for local consistency
+        if coherence is not None:
+            coh_weights = np.clip(np.nan_to_num(coherence, nan=0.0), 0.0, 1.0)
+        else:
+            coh_weights = np.ones_like(result)
+        if has_nans:
+            coh_weights[nan_mask] = 0.0
+
+        # Local consistency correction (numpy version)
+        result = self._local_consistency_correction_numpy(
+            result, phase_clean, phi_cont_clean, coh_weights,
+            nan_mask if has_nans else None, verbose=verbose,
+        )
+
+        # Restore NaN
+        if has_nans:
+            result[nan_mask] = np.nan
+
+        return result
+
+    def _local_consistency_correction_numpy(
+        self,
+        phi: np.ndarray,
+        phase_clean: np.ndarray,
+        phi_continuous: np.ndarray,
+        coh_weights: np.ndarray,
+        nan_mask: np.ndarray | None,
+        verbose: bool = False,
+    ) -> np.ndarray:
+        """
+        Fix local 2π consistency errors (numpy/CPU version).
+
+        After congruence projection, some pixels may have k off by ±1.
+        This corrects them by checking each pixel's k against neighbors,
+        using the continuous solution to determine expected differences.
+        """
+        two_pi = 2 * np.pi
+        k = np.round((phi - phase_clean) / two_pi)
+
+        # Expected dk from continuous solution
+        raw_dx = phase_clean[:, 1:] - phase_clean[:, :-1]
+        raw_dy = phase_clean[1:, :] - phase_clean[:-1, :]
+        phi_dx = phi_continuous[:, 1:] - phi_continuous[:, :-1]
+        phi_dy = phi_continuous[1:, :] - phi_continuous[:-1, :]
+
+        expected_dk_x = np.round((phi_dx - raw_dx) / two_pi)
+        expected_dk_y = np.round((phi_dy - raw_dy) / two_pi)
+
+        for iteration in range(20):
+            actual_dk_x = k[:, 1:] - k[:, :-1]
+            actual_dk_y = k[1:, :] - k[:-1, :]
+
+            err_x = actual_dk_x - expected_dk_x
+            err_y = actual_dk_y - expected_dk_y
+
+            n_bad = int(np.sum(err_x != 0)) + int(np.sum(err_y != 0))
+            if verbose and iteration == 0:
+                print(f"  Local consistency: {n_bad} inconsistent edges")
+            if n_bad == 0:
+                break
+
+            correction = np.zeros_like(k)
+
+            # Horizontal edges
+            bad_x = err_x != 0
+            left_weaker = bad_x & (coh_weights[:, :-1] <= coh_weights[:, 1:])
+            right_weaker = bad_x & ~left_weaker
+            err_x_clamped = np.clip(err_x, -1, 1)
+            correction[:, :-1] += np.where(left_weaker, err_x_clamped, 0)
+            correction[:, 1:] -= np.where(right_weaker, err_x_clamped, 0)
+
+            # Vertical edges
+            bad_y = err_y != 0
+            top_weaker = bad_y & (coh_weights[:-1, :] <= coh_weights[1:, :])
+            bottom_weaker = bad_y & ~top_weaker
+            err_y_clamped = np.clip(err_y, -1, 1)
+            correction[:-1, :] += np.where(top_weaker, err_y_clamped, 0)
+            correction[1:, :] -= np.where(bottom_weaker, err_y_clamped, 0)
+
+            if nan_mask is not None:
+                correction[nan_mask] = 0
+
+            correction = np.clip(correction, -1, 1).round()
+            if np.all(correction == 0):
+                break
+
+            k += correction
+
+        if verbose:
+            print(f"  Local consistency: converged in {iteration + 1} iterations")
+
+        return phase_clean + k * two_pi
 
     def process_tiled_batch(
         self,
