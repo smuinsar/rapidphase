@@ -754,9 +754,10 @@ class TileManager:
         Computes the dominant 2π multiple across the full overlap region
         and applies it as the correction.
 
-        Uses maximum spanning tree (Prim's algorithm) prioritizing edges
-        with the highest vote confidence, so that unreliable edges (e.g.,
-        51% coin-flip alignments) are only used as a last resort.
+        Uses maximum spanning tree (Prim's algorithm) prioritizing paths
+        by minimum vote confidence along the entire path from the reference
+        tile. This ensures tiles are reached through reliable edges first,
+        avoiding error propagation through low-confidence (e.g., 51%) edges.
         """
         import heapq
 
@@ -778,20 +779,24 @@ class TileManager:
             key=lambda idx: int(np.sum(~np.isnan(tile_dict[idx][1][::10, ::10]))),
         )
 
-        # Track which tiles have been aligned
+        # Track which tiles have been aligned, with their path confidence
         aligned = set()
         offsets = {ref_idx: 0.0}
+        path_conf = {ref_idx: 1.0}  # minimum vote fraction along path
         aligned.add(ref_idx)
 
-        # Priority queue: (-mode_count, tiebreaker, neighbor_idx, offset)
-        # Highest mode_count (most agreeing votes) is processed first.
-        pq: list[tuple[int, int, tuple[int, int], float]] = []
+        # Priority queue: (-min_path_confidence, -mode_count, tiebreaker,
+        #                   neighbor_idx, offset, edge_pct)
+        # Primary sort: highest min-path-confidence first (most reliable path).
+        # Secondary sort: highest mode_count (tiebreaker for equal confidence).
+        pq = []
         tiebreaker = 0
 
         def push_neighbors(curr_idx):
             nonlocal tiebreaker
             curr_tile, curr_data = tile_dict[curr_idx]
             curr_offset = offsets[curr_idx]
+            curr_path_conf = path_conf[curr_idx]
 
             neighbors = [
                 (curr_idx[0], curr_idx[1] + 1),
@@ -838,33 +843,40 @@ class TileManager:
                     counts = np.bincount(k_shifted)
                     k_mode = int(np.argmax(counts)) + k_min
                     mode_count = int(counts[k_mode - k_min])
+                    n_valid = int(valid_mask.sum())
+                    edge_pct = mode_count / n_valid
                     offset = k_mode * two_pi
 
+                    # Path confidence = min confidence along entire path
+                    neighbor_path_conf = min(curr_path_conf, edge_pct)
+
                     if verbose:
-                        n_valid = int(valid_mask.sum())
-                        pct = 100.0 * mode_count / n_valid
                         print(
                             f"  Edge ({curr_idx[0]},{curr_idx[1]})->({neighbor_idx[0]},{neighbor_idx[1]}): "
-                            f"k_mode={k_mode}, votes={mode_count}/{n_valid} ({pct:.0f}%), "
-                            f"offset={offset:.2f} rad"
+                            f"k_mode={k_mode}, votes={mode_count}/{n_valid} ({100*edge_pct:.0f}%), "
+                            f"path_conf={100*neighbor_path_conf:.0f}%"
                         )
 
-                    heapq.heappush(pq, (-mode_count, tiebreaker, neighbor_idx, offset))
+                    heapq.heappush(pq, (
+                        -neighbor_path_conf, -mode_count, tiebreaker,
+                        neighbor_idx, offset, neighbor_path_conf,
+                    ))
                     tiebreaker += 1
 
         push_neighbors(ref_idx)
 
         while pq:
-            neg_count, _tb, neighbor_idx, offset = heapq.heappop(pq)
+            _neg_conf, _neg_count, _tb, neighbor_idx, offset, nb_path_conf = heapq.heappop(pq)
             if neighbor_idx in aligned:
                 continue  # already aligned through a more confident path
 
             offsets[neighbor_idx] = offset
+            path_conf[neighbor_idx] = nb_path_conf
             aligned.add(neighbor_idx)
 
             if verbose:
-                print(f"  * Aligned tile {neighbor_idx} via {-neg_count} agreeing votes, "
-                      f"cumulative offset={offset:.2f} rad")
+                print(f"  * Aligned tile {neighbor_idx}, "
+                      f"offset={offset:.2f} rad, path_conf={100*nb_path_conf:.0f}%")
 
             push_neighbors(neighbor_idx)
 
