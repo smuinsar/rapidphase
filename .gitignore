@@ -1,3 +1,4 @@
 images/.DS_Store
 .DS_Store
 src/rapidphase/__pycache__
+/src/rapidphase/tiling/__pycache__

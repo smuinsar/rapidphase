@@ -1143,18 +1143,23 @@ class TileManager:
         verbose: bool = False,
     ) -> np.ndarray:
         """
-        Fix local 2π consistency errors (numpy/CPU version).
+        Fix local 2π consistency errors using coarse-to-fine approach.
 
         After congruence projection, some pixels may have k off by ±1.
-        This corrects them by checking each pixel's k against neighbors,
-        using the continuous solution to determine expected differences.
+        A single fine-level iteration only propagates corrections by 1 pixel,
+        so large 2π islands (thousands of pixels wide) need a coarse-level
+        pass first.
 
-        Uses int16 for k arrays to reduce memory on large images
-        (k values are small integers, typically |k| < 100).
+        Approach:
+        1. Downsample k, expected_dk, coh_weights by stride S
+        2. Run many iterations on the coarse grid (fast, small arrays)
+        3. Upsample coarse corrections to full resolution
+        4. Run a few fine-level iterations for edge cleanup
         """
         import time
         t0 = time.time()
         two_pi = 2 * np.pi
+        H, W = phi.shape
 
         # Use int16 for k — values are small integers, saves 4x memory
         k = np.round((phi - phase_clean) / two_pi).astype(np.int16)
@@ -1171,23 +1176,125 @@ class TileManager:
         # Free temporaries
         del raw_dx, raw_dy, phi_dx, phi_dy
 
-        max_iterations = 5  # Most corrections happen in first 2-3 iterations
+        # --- Coarse-to-fine: downsample and correct at coarse level first ---
+        stride = 32
+        if H > stride * 4 and W > stride * 4:
+            if verbose:
+                print(f"  Coarse-level correction (stride={stride})...")
 
-        for iteration in range(max_iterations):
-            # Compute errors (int16 arithmetic)
+            # Downsample k by taking every stride-th pixel
+            k_coarse = k[::stride, ::stride].copy()
+            Hc, Wc = k_coarse.shape
+
+            # Coarse expected_dk: sum fine-level expected_dk along stride path
+            # dk between coarse pixels (i, j) and (i, j+1) in full-res is:
+            #   sum of expected_dk_x[i*S, j*S], expected_dk_x[i*S, j*S+1], ..., expected_dk_x[i*S, (j+1)*S-1]
+            # Use cumulative sum for efficient computation
+            cumdk_x = np.zeros((H, W), dtype=np.int32)
+            cumdk_x[:, 1:] = np.cumsum(expected_dk_x, axis=1)
+            cumdk_y = np.zeros((H, W), dtype=np.int32)
+            cumdk_y[1:, :] = np.cumsum(expected_dk_y, axis=0)
+
+            # Coarse expected dk_x: between columns j*S and (j+1)*S at row i*S
+            coarse_edk_x = np.zeros((Hc, Wc - 1), dtype=np.int16)
+            for jc in range(Wc - 1):
+                j0 = jc * stride
+                j1 = min((jc + 1) * stride, W - 1)
+                row_idx = np.minimum(np.arange(Hc) * stride, H - 1)
+                coarse_edk_x[:, jc] = (cumdk_x[row_idx, j1] - cumdk_x[row_idx, j0]).astype(np.int16)
+
+            # Coarse expected dk_y: between rows i*S and (i+1)*S at col j*S
+            coarse_edk_y = np.zeros((Hc - 1, Wc), dtype=np.int16)
+            for ic in range(Hc - 1):
+                i0 = ic * stride
+                i1 = min((ic + 1) * stride, H - 1)
+                col_idx = np.minimum(np.arange(Wc) * stride, W - 1)
+                coarse_edk_y[ic, :] = (cumdk_y[i1, col_idx] - cumdk_y[i0, col_idx]).astype(np.int16)
+
+            del cumdk_x, cumdk_y
+
+            # Coarse coherence (min along path for conservative weighting)
+            coh_coarse = coh_weights[::stride, ::stride].copy()
+
+            # Coarse NaN mask
+            nan_coarse = nan_mask[::stride, ::stride] if nan_mask is not None else None
+
+            # Run many iterations at coarse level (small grid, fast)
+            coarse_max_iter = 200
+            for iteration in range(coarse_max_iter):
+                err_x = (k_coarse[:, 1:] - k_coarse[:, :-1]) - coarse_edk_x
+                err_y = (k_coarse[1:, :] - k_coarse[:-1, :]) - coarse_edk_y
+
+                n_bad = int(np.count_nonzero(err_x)) + int(np.count_nonzero(err_y))
+                if n_bad == 0:
+                    break
+
+                correction = np.zeros_like(k_coarse)
+
+                bad_x = err_x != 0
+                if bad_x.any():
+                    err_x_c = np.clip(err_x, -1, 1)
+                    left_weaker = bad_x & (coh_coarse[:, :-1] <= coh_coarse[:, 1:])
+                    correction[:, :-1] += np.where(left_weaker, err_x_c, 0)
+                    right_weaker = bad_x & ~left_weaker
+                    correction[:, 1:] -= np.where(right_weaker, err_x_c, 0)
+
+                bad_y = err_y != 0
+                if bad_y.any():
+                    err_y_c = np.clip(err_y, -1, 1)
+                    top_weaker = bad_y & (coh_coarse[:-1, :] <= coh_coarse[1:, :])
+                    correction[:-1, :] += np.where(top_weaker, err_y_c, 0)
+                    bottom_weaker = bad_y & ~top_weaker
+                    correction[1:, :] -= np.where(bottom_weaker, err_y_c, 0)
+
+                if nan_coarse is not None:
+                    correction[nan_coarse] = 0
+
+                np.clip(correction, -1, 1, out=correction)
+                if not correction.any():
+                    break
+
+                k_coarse += correction.astype(np.int16)
+
+            if verbose:
+                print(f"  Coarse level: {iteration + 1} iterations, {n_bad} bad edges ({time.time()-t0:.1f}s)")
+
+            # Upsample coarse corrections to full resolution
+            # Correction = k_coarse_corrected - k_coarse_original
+            k_coarse_orig = k[::stride, ::stride]
+            dk_coarse = (k_coarse - k_coarse_orig).astype(np.int16)
+
+            if dk_coarse.any():
+                # Nearest-neighbor upsample: each coarse pixel covers a stride x stride block
+                # Use repeat for efficient upsampling
+                dk_full = np.repeat(np.repeat(dk_coarse, stride, axis=0), stride, axis=1)
+                # Trim to original size
+                dk_full = dk_full[:H, :W]
+
+                if nan_mask is not None:
+                    dk_full[nan_mask] = 0
+
+                k += dk_full.astype(np.int16)
+                del dk_full
+
+            del k_coarse, k_coarse_orig, dk_coarse, coh_coarse
+
+        # --- Fine-level iterations for edge cleanup ---
+        fine_max_iter = 5
+
+        for iteration in range(fine_max_iter):
             err_x = (k[:, 1:] - k[:, :-1]) - expected_dk_x
             err_y = (k[1:, :] - k[:-1, :]) - expected_dk_y
 
             n_bad = int(np.count_nonzero(err_x)) + int(np.count_nonzero(err_y))
             if verbose:
                 elapsed = time.time() - t0
-                print(f"  Local consistency iter {iteration}: {n_bad} bad edges ({elapsed:.1f}s)")
+                print(f"  Fine consistency iter {iteration}: {n_bad} bad edges ({elapsed:.1f}s)")
             if n_bad == 0:
                 break
 
             correction = np.zeros_like(k)
 
-            # Horizontal edges: clamp error to ±1, apply to weaker pixel
             bad_x = err_x != 0
             if bad_x.any():
                 err_x_c = np.clip(err_x, -1, 1)
@@ -1197,7 +1304,6 @@ class TileManager:
                 correction[:, 1:] -= np.where(right_weaker, err_x_c, 0)
                 del err_x_c, left_weaker, right_weaker
 
-            # Vertical edges
             bad_y = err_y != 0
             if bad_y.any():
                 err_y_c = np.clip(err_y, -1, 1)
@@ -1220,7 +1326,7 @@ class TileManager:
             del correction
 
         if verbose:
-            print(f"  Local consistency: done in {iteration + 1} iterations ({time.time()-t0:.1f}s)")
+            print(f"  Local consistency: done ({time.time()-t0:.1f}s)")
 
         return phase_clean + k.astype(np.float64) * two_pi
 
