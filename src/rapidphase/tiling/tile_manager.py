@@ -379,20 +379,32 @@ class TileManager:
         if align_phases and len(tiles_data) > 1:
             tiles_data = self._align_tile_phases(tiles_data)
 
-        # Hard-stitch: each tile contributes only its DATA region.
-        result = self.dm.zeros((H, W))
-        result[:] = float('nan')
+        # Cosine-feathered blending for smooth transitions
+        weighted_sum = self.dm.zeros((H, W))
+        weight_sum = self.dm.zeros((H, W))
 
         for tile, data in tiles_data:
-            dr0 = tile.data_row_start - tile.row_start
-            dr1 = tile.data_row_end - tile.row_start
-            dc0 = tile.data_col_start - tile.col_start
-            dc1 = tile.data_col_end - tile.col_start
+            blend_w = self.create_blend_weights(data.shape, tile, (H, W))
 
-            result[
-                tile.data_row_start:tile.data_row_end,
-                tile.data_col_start:tile.data_col_end,
-            ] = data[dr0:dr1, dc0:dc1]
+            # Zero weight where data is NaN
+            nan_mask = torch.isnan(data)
+            blend_w[nan_mask] = 0.0
+            data_clean = torch.where(nan_mask, torch.zeros_like(data), data)
+
+            weighted_sum[
+                tile.row_start:tile.row_end,
+                tile.col_start:tile.col_end,
+            ] += data_clean * blend_w
+
+            weight_sum[
+                tile.row_start:tile.row_end,
+                tile.col_start:tile.col_end,
+            ] += blend_w
+
+        # Compute blended result
+        result = torch.full((H, W), float('nan'), dtype=self.dm.dtype, device=self.dm.device)
+        valid = weight_sum > 0
+        result[valid] = weighted_sum[valid] / weight_sum[valid]
 
         return result
 
@@ -739,8 +751,8 @@ class TileManager:
         Align phase offsets between adjacent tiles (numpy/CPU version).
 
         Each tile has an arbitrary phase offset (integer multiple of 2π).
-        Computes the dominant 2π multiple in a thin center strip of the
-        overlap and applies it as the correction.
+        Computes the dominant 2π multiple across the full overlap region
+        and applies it as the correction.
 
         Uses BFS from the tile with the most valid pixels.
         """
@@ -787,71 +799,26 @@ class TileManager:
 
                 neighbor_tile, neighbor_data = tile_dict[neighbor_idx]
 
-                # Find overlapping region in global coordinates
-                overlap_row_start = max(curr_tile.row_start, neighbor_tile.row_start)
-                overlap_row_end = min(curr_tile.row_end, neighbor_tile.row_end)
-                overlap_col_start = max(curr_tile.col_start, neighbor_tile.col_start)
-                overlap_col_end = min(curr_tile.col_end, neighbor_tile.col_end)
+                # Find full overlapping region in global coordinates
+                r0 = max(curr_tile.row_start, neighbor_tile.row_start)
+                r1 = min(curr_tile.row_end, neighbor_tile.row_end)
+                c0 = max(curr_tile.col_start, neighbor_tile.col_start)
+                c1 = min(curr_tile.col_end, neighbor_tile.col_end)
 
-                if overlap_row_start >= overlap_row_end or overlap_col_start >= overlap_col_end:
+                if r0 >= r1 or c0 >= c1:
                     continue
 
-                oh = overlap_row_end - overlap_row_start
-                ow = overlap_col_end - overlap_col_start
-
-                # Sample a thin strip at the DATA BOUNDARY — the exact
-                # row/column where the hard stitch will happen. This ensures
-                # the k value we measure is what matters for visual continuity
-                # at the stitch, not some interior point where the tiles may
-                # have 2π transitions at different positions.
-                strip_half = 10  # ±10 pixels around boundary
-                margin_frac = 0.1  # skip 10% margins in long direction
-
-                # Determine the stitch boundary position
-                # For horizontal neighbors: stitch at the shared data column edge
-                # For vertical neighbors: stitch at the shared data row edge
-                dr = neighbor_idx[0] - curr_idx[0]
-                dc = neighbor_idx[1] - curr_idx[1]
-
-                if dc != 0:
-                    # Horizontal neighbor: stitch at a column boundary
-                    if dc > 0:
-                        stitch_col = curr_tile.data_col_end  # right edge of curr
-                    else:
-                        stitch_col = curr_tile.data_col_start  # left edge of curr
-                    cc0 = max(overlap_col_start, stitch_col - strip_half)
-                    cc1 = min(overlap_col_end, stitch_col + strip_half)
-                    margin_h = int(oh * margin_frac)
-                    cr0 = overlap_row_start + margin_h
-                    cr1 = overlap_row_end - margin_h
-                else:
-                    # Vertical neighbor: stitch at a row boundary
-                    if dr > 0:
-                        stitch_row = curr_tile.data_row_end  # bottom edge of curr
-                    else:
-                        stitch_row = curr_tile.data_row_start  # top edge of curr
-                    cr0 = max(overlap_row_start, stitch_row - strip_half)
-                    cr1 = min(overlap_row_end, stitch_row + strip_half)
-                    margin_w = int(ow * margin_frac)
-                    cc0 = overlap_col_start + margin_w
-                    cc1 = overlap_col_end - margin_w
-
-                if cr0 >= cr1:
-                    cr0, cr1 = overlap_row_start, overlap_row_end
-                if cc0 >= cc1:
-                    cc0, cc1 = overlap_col_start, overlap_col_end
-
-                # Subsample for speed on large strips
-                n_pixels = (cr1 - cr0) * (cc1 - cc0)
-                stride = max(1, int(np.sqrt(n_pixels / 50000))) if n_pixels > 50000 else 1
+                # Subsample for speed on large overlaps
+                n_pixels = (r1 - r0) * (c1 - c0)
+                stride = max(1, int(np.sqrt(n_pixels / 100000))) if n_pixels > 100000 else 1
 
                 curr_overlap = curr_data[
-                    cr0 - curr_tile.row_start:cr1 - curr_tile.row_start:stride,
-                    cc0 - curr_tile.col_start:cc1 - curr_tile.col_start:stride,
+                    r0 - curr_tile.row_start:r1 - curr_tile.row_start:stride,
+                    c0 - curr_tile.col_start:c1 - curr_tile.col_start:stride,
                 ]
                 neighbor_overlap = neighbor_data[
-                    cr0 - neighbor_tile.row_start:cr1 - neighbor_tile.row_start:stride,
-                    cc0 - neighbor_tile.col_start:cc1 - neighbor_tile.col_start:stride,
+                    r0 - neighbor_tile.row_start:r1 - neighbor_tile.row_start:stride,
+                    c0 - neighbor_tile.col_start:c1 - neighbor_tile.col_start:stride,
                 ]
 
                 diff = (curr_overlap + curr_offset) - neighbor_overlap
@@ -894,6 +861,68 @@ class TileManager:
 
         return aligned_tiles
 
+    def _create_blend_weights_numpy(
+        self,
+        tile: TileInfo,
+        tile_shape: tuple[int, int],
+        full_shape: tuple[int, int],
+    ) -> np.ndarray:
+        """
+        Create cosine-feathered blend weights for a tile (numpy version).
+
+        Weights are 1.0 in the DATA region and ramp smoothly from 1→~0
+        across the overlap region at each edge that borders another tile.
+
+        Parameters
+        ----------
+        tile : TileInfo
+            Tile information.
+        tile_shape : tuple of int
+            Shape of the tile data (tile_H, tile_W).
+        full_shape : tuple of int
+            Shape of the full image (H, W).
+
+        Returns
+        -------
+        np.ndarray
+            Blend weights of shape (tile_H, tile_W), values in (0, 1].
+        """
+        tile_H, tile_W = tile_shape
+        H, W = full_shape
+        weights = np.ones((tile_H, tile_W), dtype=np.float64)
+
+        feather = max(1, int(self.overlap * 0.9))
+
+        # Top edge feathering (tile extends above its DATA region)
+        if tile.row_start > 0:
+            n = min(feather, tile_H)
+            t = np.linspace(0, 1, n + 1, dtype=np.float64)[1:]
+            ramp = 0.5 * (1 - np.cos(np.pi * t))
+            weights[:n, :] *= ramp[:, np.newaxis]
+
+        # Bottom edge feathering
+        if tile.row_end < H:
+            n = min(feather, tile_H)
+            t = np.linspace(0, 1, n + 1, dtype=np.float64)[1:]
+            ramp = 0.5 * (1 - np.cos(np.pi * t))
+            weights[-n:, :] *= ramp[::-1, np.newaxis]
+
+        # Left edge feathering
+        if tile.col_start > 0:
+            n = min(feather, tile_W)
+            t = np.linspace(0, 1, n + 1, dtype=np.float64)[1:]
+            ramp = 0.5 * (1 - np.cos(np.pi * t))
+            weights[:, :n] *= ramp[np.newaxis, :]
+
+        # Right edge feathering
+        if tile.col_end < W:
+            n = min(feather, tile_W)
+            t = np.linspace(0, 1, n + 1, dtype=np.float64)[1:]
+            ramp = 0.5 * (1 - np.cos(np.pi * t))
+            weights[:, -n:] *= ramp[np.newaxis, ::-1]
+
+        return weights
+
     def _merge_tiles_numpy(
         self,
         tiles_data: list[tuple[TileInfo, np.ndarray]],
@@ -903,8 +932,9 @@ class TileManager:
         """
         Merge processed tiles back into a full image (numpy/CPU version).
 
-        Aligns phase offsets using integer 2π voting in the overlap center
-        strip, then hard-stitches each tile's DATA region (no blending).
+        Aligns phase offsets using integer 2π voting in the full overlap
+        region, then blends tiles with cosine-feathered weights for smooth
+        transitions at tile boundaries.
         """
         H, W = shape
 
@@ -914,21 +944,33 @@ class TileManager:
                 print("Aligning tile phases...")
             tiles_data = self._align_tile_phases_numpy(tiles_data, verbose=verbose)
 
-        # Hard-stitch: each tile contributes only its DATA region.
-        # This avoids blending-induced non-congruence at boundaries.
-        result = np.full((H, W), np.nan, dtype=np.float64)
+        # Cosine-feathered blending: each tile contributes its full extent
+        # with weights that ramp down in overlap regions.
+        weighted_sum = np.zeros((H, W), dtype=np.float64)
+        weight_sum = np.zeros((H, W), dtype=np.float64)
 
         for tile, data in tiles_data:
-            # Extract the DATA region (non-overlap portion) from the tile
-            dr0 = tile.data_row_start - tile.row_start
-            dr1 = tile.data_row_end - tile.row_start
-            dc0 = tile.data_col_start - tile.col_start
-            dc1 = tile.data_col_end - tile.col_start
+            blend_w = self._create_blend_weights_numpy(tile, data.shape, (H, W))
 
-            result[
-                tile.data_row_start:tile.data_row_end,
-                tile.data_col_start:tile.data_col_end,
-            ] = data[dr0:dr1, dc0:dc1]
+            # Zero weight where data is NaN
+            nan_mask = np.isnan(data)
+            blend_w[nan_mask] = 0.0
+            data_clean = np.where(nan_mask, 0.0, data)
+
+            weighted_sum[
+                tile.row_start:tile.row_end,
+                tile.col_start:tile.col_end,
+            ] += data_clean * blend_w
+
+            weight_sum[
+                tile.row_start:tile.row_end,
+                tile.col_start:tile.col_end,
+            ] += blend_w
+
+        # Compute blended result
+        result = np.full((H, W), np.nan, dtype=np.float64)
+        valid = weight_sum > 0
+        result[valid] = weighted_sum[valid] / weight_sum[valid]
 
         return result
 
