@@ -380,8 +380,6 @@ class TileManager:
             tiles_data = self._align_tile_phases(tiles_data)
 
         # Hard-stitch: each tile contributes only its DATA region.
-        # Blending congruent solutions that disagree on k creates
-        # non-congruent artifacts.
         result = self.dm.zeros((H, W))
         result[:] = float('nan')
 
@@ -735,17 +733,16 @@ class TileManager:
     def _align_tile_phases_numpy(
         self,
         tiles_data: list[tuple[TileInfo, np.ndarray]],
+        verbose: bool = False,
     ) -> list[tuple[TileInfo, np.ndarray]]:
         """
         Align phase offsets between adjacent tiles (numpy/CPU version).
 
-        Each tile from phase unwrapping has an arbitrary constant offset.
-        This method computes and applies corrections so that overlapping
-        regions have consistent phase values.
+        Each tile has an arbitrary phase offset (integer multiple of 2π).
+        Computes the dominant 2π multiple in a thin center strip of the
+        overlap and applies it as the correction.
 
-        Uses BFS from the tile with the most valid pixels. The median of
-        the difference in the center band of the overlap region gives a
-        robust offset estimate.
+        Uses BFS from the tile with the most valid pixels.
         """
         if len(tiles_data) <= 1:
             return tiles_data
@@ -799,22 +796,40 @@ class TileManager:
                 if overlap_row_start >= overlap_row_end or overlap_col_start >= overlap_col_end:
                     continue
 
-                # Use center 50% of overlap to avoid edge artifacts
                 oh = overlap_row_end - overlap_row_start
                 ow = overlap_col_end - overlap_col_start
-                margin_h = oh // 4
-                margin_w = ow // 4
 
-                cr0 = overlap_row_start + margin_h
-                cr1 = overlap_row_end - margin_h
-                cc0 = overlap_col_start + margin_w
-                cc1 = overlap_col_end - margin_w
+                # Sample a thin strip at the CENTER of the overlap in the
+                # narrow direction (perpendicular to tile boundary). This
+                # avoids internal 2π transitions that may occur at different
+                # positions in the two tiles, which would split the k votes.
+                # Use most of the extent in the long direction for statistics.
+                strip_half = 10  # ±10 pixels around center
+                margin_frac = 0.1  # skip 10% margins in long direction
+
+                if oh < ow:
+                    # Vertical neighbor: overlap is short (rows) and wide (cols)
+                    center_r = overlap_row_start + oh // 2
+                    cr0 = max(overlap_row_start, center_r - strip_half)
+                    cr1 = min(overlap_row_end, center_r + strip_half)
+                    margin_w = int(ow * margin_frac)
+                    cc0 = overlap_col_start + margin_w
+                    cc1 = overlap_col_end - margin_w
+                else:
+                    # Horizontal neighbor: overlap is tall (rows) and narrow (cols)
+                    margin_h = int(oh * margin_frac)
+                    cr0 = overlap_row_start + margin_h
+                    cr1 = overlap_row_end - margin_h
+                    center_c = overlap_col_start + ow // 2
+                    cc0 = max(overlap_col_start, center_c - strip_half)
+                    cc1 = min(overlap_col_end, center_c + strip_half)
+
                 if cr0 >= cr1:
                     cr0, cr1 = overlap_row_start, overlap_row_end
                 if cc0 >= cc1:
                     cc0, cc1 = overlap_col_start, overlap_col_end
 
-                # Subsample for speed on large overlaps
+                # Subsample for speed on large strips
                 n_pixels = (cr1 - cr0) * (cc1 - cc0)
                 stride = max(1, int(np.sqrt(n_pixels / 50000))) if n_pixels > 50000 else 1
 
@@ -831,11 +846,9 @@ class TileManager:
                 valid_mask = ~np.isnan(diff)
 
                 if valid_mask.any():
-                    # GAMMA-style: compute integer 2π multiple for each pixel,
-                    # then take the mode (most common value). This ensures the
-                    # offset is always an exact multiple of 2π, preserving
-                    # congruence. Using median gives fractional offsets that
-                    # break congruence and cascade errors through BFS.
+                    # Compute integer 2π multiple for each pixel, then take the
+                    # mode (most common value). This ensures the offset is always
+                    # an exact multiple of 2π, preserving congruence.
                     two_pi = 2 * np.pi
                     k_per_pixel = np.round(diff[valid_mask] / two_pi).astype(np.int64)
                     k_min = int(k_per_pixel.min())
@@ -843,6 +856,16 @@ class TileManager:
                     counts = np.bincount(k_shifted)
                     k_mode = int(np.argmax(counts)) + k_min
                     offset = k_mode * two_pi
+
+                    if verbose:
+                        n_valid = int(valid_mask.sum())
+                        mode_count = int(counts[k_mode - k_min])
+                        pct = 100.0 * mode_count / n_valid
+                        print(
+                            f"  Align ({curr_idx[0]},{curr_idx[1]})->({neighbor_idx[0]},{neighbor_idx[1]}): "
+                            f"k_mode={k_mode}, votes={mode_count}/{n_valid} ({pct:.0f}%), "
+                            f"offset={offset:.2f} rad"
+                        )
                 else:
                     offset = 0.0
 
@@ -868,10 +891,8 @@ class TileManager:
         """
         Merge processed tiles back into a full image (numpy/CPU version).
 
-        Aligns phase offsets using GAMMA-style integer 2π voting in overlap
-        regions, then hard-stitches each tile's DATA region (no blending).
-        This preserves congruence — blending two congruent solutions that
-        disagree on k creates non-congruent artifacts.
+        Aligns phase offsets using integer 2π voting in the overlap center
+        strip, then hard-stitches each tile's DATA region (no blending).
         """
         H, W = shape
 
@@ -879,7 +900,7 @@ class TileManager:
         if len(tiles_data) > 1:
             if verbose:
                 print("Aligning tile phases...")
-            tiles_data = self._align_tile_phases_numpy(tiles_data)
+            tiles_data = self._align_tile_phases_numpy(tiles_data, verbose=verbose)
 
         # Hard-stitch: each tile contributes only its DATA region.
         # This avoids blending-induced non-congruence at boundaries.
