@@ -2,3 +2,4 @@ images/.DS_Store
 .DS_Store
 src/rapidphase/__pycache__
 /src/rapidphase/tiling/__pycache__
+src/rapidphase/tiling/__pycache__/tile_manager.cpython-312.pyc
