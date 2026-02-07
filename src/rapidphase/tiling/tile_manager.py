@@ -754,12 +754,17 @@ class TileManager:
         Computes the dominant 2π multiple across the full overlap region
         and applies it as the correction.
 
-        Uses BFS from the tile with the most valid pixels.
+        Uses maximum spanning tree (Prim's algorithm) prioritizing edges
+        with the highest vote confidence, so that unreliable edges (e.g.,
+        51% coin-flip alignments) are only used as a last resort.
         """
+        import heapq
+
         if len(tiles_data) <= 1:
             return tiles_data
 
         n_rows, n_cols = self.ntiles
+        two_pi = 2 * np.pi
 
         # Create a dictionary for easy lookup by (row, col) index
         tile_dict = {}
@@ -778,11 +783,13 @@ class TileManager:
         offsets = {ref_idx: 0.0}
         aligned.add(ref_idx)
 
-        # BFS to propagate alignment
-        queue = [ref_idx]
+        # Priority queue: (-mode_count, tiebreaker, neighbor_idx, offset)
+        # Highest mode_count (most agreeing votes) is processed first.
+        pq: list[tuple[int, int, tuple[int, int], float]] = []
+        tiebreaker = 0
 
-        while queue:
-            curr_idx = queue.pop(0)
+        def push_neighbors(curr_idx):
+            nonlocal tiebreaker
             curr_tile, curr_data = tile_dict[curr_idx]
             curr_offset = offsets[curr_idx]
 
@@ -825,32 +832,41 @@ class TileManager:
                 valid_mask = ~np.isnan(diff)
 
                 if valid_mask.any():
-                    # Compute integer 2π multiple for each pixel, then take the
-                    # mode (most common value). This ensures the offset is always
-                    # an exact multiple of 2π, preserving congruence.
-                    two_pi = 2 * np.pi
                     k_per_pixel = np.round(diff[valid_mask] / two_pi).astype(np.int64)
                     k_min = int(k_per_pixel.min())
                     k_shifted = k_per_pixel - k_min
                     counts = np.bincount(k_shifted)
                     k_mode = int(np.argmax(counts)) + k_min
+                    mode_count = int(counts[k_mode - k_min])
                     offset = k_mode * two_pi
 
                     if verbose:
                         n_valid = int(valid_mask.sum())
-                        mode_count = int(counts[k_mode - k_min])
                         pct = 100.0 * mode_count / n_valid
                         print(
-                            f"  Align ({curr_idx[0]},{curr_idx[1]})->({neighbor_idx[0]},{neighbor_idx[1]}): "
+                            f"  Edge ({curr_idx[0]},{curr_idx[1]})->({neighbor_idx[0]},{neighbor_idx[1]}): "
                             f"k_mode={k_mode}, votes={mode_count}/{n_valid} ({pct:.0f}%), "
                             f"offset={offset:.2f} rad"
                         )
-                else:
-                    offset = 0.0
 
-                offsets[neighbor_idx] = offset
-                aligned.add(neighbor_idx)
-                queue.append(neighbor_idx)
+                    heapq.heappush(pq, (-mode_count, tiebreaker, neighbor_idx, offset))
+                    tiebreaker += 1
+
+        push_neighbors(ref_idx)
+
+        while pq:
+            neg_count, _tb, neighbor_idx, offset = heapq.heappop(pq)
+            if neighbor_idx in aligned:
+                continue  # already aligned through a more confident path
+
+            offsets[neighbor_idx] = offset
+            aligned.add(neighbor_idx)
+
+            if verbose:
+                print(f"  * Aligned tile {neighbor_idx} via {-neg_count} agreeing votes, "
+                      f"cumulative offset={offset:.2f} rad")
+
+            push_neighbors(neighbor_idx)
 
         # Apply offsets
         aligned_tiles = []
