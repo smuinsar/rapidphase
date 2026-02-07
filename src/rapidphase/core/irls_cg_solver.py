@@ -254,14 +254,6 @@ class IRLSCGUnwrapper(BaseUnwrapper):
         phi = phi - dc_adjust
         phi_continuous = phi_continuous - dc_adjust
 
-        # For tiled processing, return the continuous (pre-congruence) solution.
-        # Congruence projection will be applied after merging all tiles to
-        # avoid per-tile 2π transition inconsistencies at tile boundaries.
-        if kwargs.get('return_continuous', False):
-            if has_nans:
-                phi_continuous[nan_mask] = float('nan')
-            return phi_continuous
-
         # Project to nearest congruent solution:
         # unwrapped = wrapped + k * 2*pi, where k is the nearest integer
         k = torch.round((phi - phase_clean) / two_pi)
