@@ -379,38 +379,22 @@ class TileManager:
         if align_phases and len(tiles_data) > 1:
             tiles_data = self._align_tile_phases(tiles_data)
 
-        # Accumulators for weighted average
+        # Hard-stitch: each tile contributes only its DATA region.
+        # Blending congruent solutions that disagree on k creates
+        # non-congruent artifacts.
         result = self.dm.zeros((H, W))
-        weight_sum = self.dm.zeros((H, W))
+        result[:] = float('nan')
 
         for tile, data in tiles_data:
-            tile_shape = data.shape
-            weights = self.create_blend_weights(tile_shape, tile, shape)
+            dr0 = tile.data_row_start - tile.row_start
+            dr1 = tile.data_row_end - tile.row_start
+            dc0 = tile.data_col_start - tile.col_start
+            dc1 = tile.data_col_end - tile.col_start
 
-            # Create mask for valid (non-NaN) pixels
-            valid_mask = ~torch.isnan(data)
-
-            # Zero out weights for NaN pixels
-            effective_weights = weights.clone()
-            effective_weights[~valid_mask] = 0.0
-
-            # Replace NaN with 0 for accumulation (will be masked by weights)
-            safe_data = data.clone()
-            safe_data[~valid_mask] = 0.0
-
-            # Add weighted contribution
-            result[tile.row_start:tile.row_end, tile.col_start:tile.col_end] += (
-                effective_weights * safe_data
-            )
-            weight_sum[tile.row_start:tile.row_end, tile.col_start:tile.col_end] += (
-                effective_weights
-            )
-
-        # Normalize by weight sum
-        # Pixels with zero weight sum had no valid data - set to NaN
-        valid_output = weight_sum > 1e-10
-        result[valid_output] = result[valid_output] / weight_sum[valid_output]
-        result[~valid_output] = float('nan')
+            result[
+                tile.data_row_start:tile.data_row_end,
+                tile.data_col_start:tile.data_col_end,
+            ] = data[dr0:dr1, dc0:dc1]
 
         return result
 
@@ -847,7 +831,18 @@ class TileManager:
                 valid_mask = ~np.isnan(diff)
 
                 if valid_mask.any():
-                    offset = float(np.median(diff[valid_mask]))
+                    # GAMMA-style: compute integer 2π multiple for each pixel,
+                    # then take the mode (most common value). This ensures the
+                    # offset is always an exact multiple of 2π, preserving
+                    # congruence. Using median gives fractional offsets that
+                    # break congruence and cascade errors through BFS.
+                    two_pi = 2 * np.pi
+                    k_per_pixel = np.round(diff[valid_mask] / two_pi).astype(np.int64)
+                    k_min = int(k_per_pixel.min())
+                    k_shifted = k_per_pixel - k_min
+                    counts = np.bincount(k_shifted)
+                    k_mode = int(np.argmax(counts)) + k_min
+                    offset = k_mode * two_pi
                 else:
                     offset = 0.0
 
@@ -873,8 +868,10 @@ class TileManager:
         """
         Merge processed tiles back into a full image (numpy/CPU version).
 
-        Aligns phase offsets using median in overlap regions, then blends
-        with cosine feathering at DATA boundaries.
+        Aligns phase offsets using GAMMA-style integer 2π voting in overlap
+        regions, then hard-stitches each tile's DATA region (no blending).
+        This preserves congruence — blending two congruent solutions that
+        disagree on k creates non-congruent artifacts.
         """
         H, W = shape
 
@@ -884,66 +881,21 @@ class TileManager:
                 print("Aligning tile phases...")
             tiles_data = self._align_tile_phases_numpy(tiles_data)
 
-        # Accumulators for weighted average (CPU memory)
-        result = np.zeros((H, W), dtype=np.float64)
-        weight_sum = np.zeros((H, W), dtype=np.float64)
+        # Hard-stitch: each tile contributes only its DATA region.
+        # This avoids blending-induced non-congruence at boundaries.
+        result = np.full((H, W), np.nan, dtype=np.float64)
 
         for tile, data in tiles_data:
-            tile_H, tile_W = data.shape
+            # Extract the DATA region (non-overlap portion) from the tile
+            dr0 = tile.data_row_start - tile.row_start
+            dr1 = tile.data_row_end - tile.row_start
+            dc0 = tile.data_col_start - tile.col_start
+            dc1 = tile.data_col_end - tile.col_start
 
-            # Create blend weights based on DATA boundaries
-            weights = np.ones((tile_H, tile_W), dtype=np.float64)
-
-            # Top overlap region
-            top_overlap = tile.data_row_start - tile.row_start
-            if top_overlap > 0:
-                t = np.linspace(0, 1, top_overlap + 1)[1:]
-                ramp = 0.5 * (1 - np.cos(t * np.pi))
-                weights[:top_overlap, :] *= ramp[:, np.newaxis]
-
-            # Bottom overlap region
-            bottom_overlap = tile.row_end - tile.data_row_end
-            if bottom_overlap > 0:
-                t = np.linspace(0, 1, bottom_overlap + 1)[1:]
-                ramp = 0.5 * (1 - np.cos(t * np.pi))
-                ramp = ramp[::-1]
-                weights[-bottom_overlap:, :] *= ramp[:, np.newaxis]
-
-            # Left overlap region
-            left_overlap = tile.data_col_start - tile.col_start
-            if left_overlap > 0:
-                t = np.linspace(0, 1, left_overlap + 1)[1:]
-                ramp = 0.5 * (1 - np.cos(t * np.pi))
-                weights[:, :left_overlap] *= ramp[np.newaxis, :]
-
-            # Right overlap region
-            right_overlap = tile.col_end - tile.data_col_end
-            if right_overlap > 0:
-                t = np.linspace(0, 1, right_overlap + 1)[1:]
-                ramp = 0.5 * (1 - np.cos(t * np.pi))
-                ramp = ramp[::-1]
-                weights[:, -right_overlap:] *= ramp[np.newaxis, :]
-
-            # Handle NaN pixels
-            valid_mask = ~np.isnan(data)
-            effective_weights = weights.copy()
-            effective_weights[~valid_mask] = 0.0
-
-            safe_data = data.copy()
-            safe_data[~valid_mask] = 0.0
-
-            # Add weighted contribution
-            result[tile.row_start:tile.row_end, tile.col_start:tile.col_end] += (
-                effective_weights * safe_data
-            )
-            weight_sum[tile.row_start:tile.row_end, tile.col_start:tile.col_end] += (
-                effective_weights
-            )
-
-        # Normalize
-        valid_output = weight_sum > 1e-10
-        result[valid_output] = result[valid_output] / weight_sum[valid_output]
-        result[~valid_output] = np.nan
+            result[
+                tile.data_row_start:tile.data_row_end,
+                tile.data_col_start:tile.data_col_end,
+            ] = data[dr0:dr1, dc0:dc1]
 
         return result
 
