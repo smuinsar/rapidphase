@@ -85,6 +85,49 @@ def clear_gpu_cache(include_cupy: bool = True) -> None:
             pass  # CuPy not installed, skip
 
 
+def _auto_scale_ntiles(
+    shape: tuple[int, int],
+    ntiles: tuple[int, int],
+    max_tile_pixels: int = 80_000_000,
+) -> tuple[int, int]:
+    """
+    Ensure tiles don't exceed max_tile_pixels by increasing ntiles if needed.
+
+    The CG solver's convergence degrades on very large tiles, causing
+    2pi errors in the congruence projection. This limits tile size to
+    keep the solver accurate.
+
+    Parameters
+    ----------
+    shape : tuple of int
+        Image shape (H, W).
+    ntiles : tuple of int
+        Requested (n_rows, n_cols).
+    max_tile_pixels : int
+        Maximum pixels per tile (default 80M).
+
+    Returns
+    -------
+    tuple of int
+        Adjusted (n_rows, n_cols), >= the input ntiles.
+    """
+    H, W = shape
+    n_rows, n_cols = ntiles
+
+    while True:
+        tile_h = H // n_rows
+        tile_w = W // n_cols
+        if tile_h * tile_w <= max_tile_pixels:
+            break
+        # Increase the dimension with the larger tile extent
+        if tile_h >= tile_w:
+            n_rows += 1
+        else:
+            n_cols += 1
+
+    return (n_rows, n_cols)
+
+
 def unwrap(
     igram: np.ndarray,
     corr: np.ndarray | None = None,
@@ -98,6 +141,8 @@ def unwrap(
     tolerance: float = 1e-4,
     delta: float = 0.1,
     release_memory: bool = True,
+    verbose: bool = False,
+    alignment_stride: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Unwrap interferometric phase using GPU-accelerated algorithms.
@@ -129,6 +174,8 @@ def unwrap(
     ntiles : tuple of int, optional
         If provided, splits image into (nrow, ncol) tiles for processing.
         Useful for large images that don't fit in GPU memory.
+        Tiles are automatically enlarged if they exceed the solver's
+        reliable size limit (~80M pixels per tile).
     tile_overlap : int, optional
         Overlap in pixels between tiles. If None (default), automatically
         calculated as 10% of the smaller tile dimension for good blending.
@@ -145,10 +192,14 @@ def unwrap(
         L1 more closely but may cause instability. Only used when
         algorithm="irls_cg" (default 0.1).
     release_memory : bool
-        If True, clear GPU memory cache after processing (default False).
-        This is useful when using rapidphase alongside other GPU frameworks
-        like CuPy that maintain separate memory pools. Clearing the cache
-        prevents out-of-memory errors when switching between frameworks.
+        If True, clear GPU memory cache after processing (default True).
+    verbose : bool
+        If True, print detailed progress including tile alignment info
+        (default False).
+    alignment_stride : int, optional
+        Subsample stride for tile overlap alignment. Larger values speed
+        up alignment at the cost of fewer sample pixels. If None (default),
+        automatically set to sample ~30K pixels per overlap region.
 
     Returns
     -------
@@ -233,6 +284,18 @@ def unwrap(
 
     # Process with or without tiling
     if ntiles is not None:
+        # Auto-scale ntiles to keep tiles within solver's reliable size
+        ntiles_orig = ntiles
+        ntiles = _auto_scale_ntiles(phase.shape, ntiles)
+        if ntiles != ntiles_orig:
+            import warnings
+            warnings.warn(
+                f"ntiles increased from {ntiles_orig} to {ntiles} to keep "
+                f"tile size within solver limits. Large tiles (>80M pixels) "
+                f"can cause phase unwrapping errors.",
+                UserWarning,
+            )
+
         # Memory-efficient path: keep data as numpy, only convert tiles to GPU
         n_rows, n_cols = ntiles
         tile_h = phase.shape[0] // n_rows
@@ -281,7 +344,8 @@ def unwrap(
             coherence=coherence,
             nan_mask=nan_mask,
             n_gpus=n_gpus,
-            verbose=True,
+            verbose=verbose,
+            alignment_stride=alignment_stride,
         )
     else:
         # Standard path: convert entire image to GPU tensors

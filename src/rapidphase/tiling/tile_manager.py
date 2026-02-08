@@ -477,6 +477,7 @@ class TileManager:
         nan_mask: np.ndarray | None = None,
         n_gpus: int | None = None,
         verbose: bool = True,
+        alignment_stride: int | None = None,
     ) -> np.ndarray:
         """
         Process an image tile-by-tile with memory-efficient numpy I/O.
@@ -536,12 +537,14 @@ class TileManager:
         if use_n_gpus > 1 and self.dm.device_type == "cuda":
             # Multi-GPU parallel processing
             return self._process_tiled_multi_gpu(
-                image, unwrapper_factory, coherence, nan_mask, tiles, use_gpu_ids, verbose
+                image, unwrapper_factory, coherence, nan_mask, tiles, use_gpu_ids, verbose,
+                alignment_stride=alignment_stride,
             )
         else:
             # Single device processing
             return self._process_tiled_single_device(
-                image, unwrapper_factory, coherence, nan_mask, tiles, verbose
+                image, unwrapper_factory, coherence, nan_mask, tiles, verbose,
+                alignment_stride=alignment_stride,
             )
 
     def _process_tiled_single_device(
@@ -552,6 +555,7 @@ class TileManager:
         nan_mask: np.ndarray | None,
         tiles: list[TileInfo],
         verbose: bool,
+        alignment_stride: int | None = None,
     ) -> np.ndarray:
         """Single-device tile processing."""
         H, W = image.shape
@@ -618,7 +622,7 @@ class TileManager:
             print("  Merging tiles with phase alignment...")
 
         # Merge results with phase alignment
-        result = self._merge_tiles_numpy(processed_tiles_np, (H, W), verbose=verbose)
+        result = self._merge_tiles_numpy(processed_tiles_np, (H, W), verbose=verbose, alignment_stride=alignment_stride)
 
         if verbose and not HAS_TQDM:
             print("  Done.")
@@ -634,6 +638,7 @@ class TileManager:
         tiles: list[TileInfo],
         gpu_ids: list[int],
         verbose: bool,
+        alignment_stride: int | None = None,
     ) -> np.ndarray:
         """Multi-GPU parallel tile processing."""
         from rapidphase.device.manager import DeviceManager
@@ -735,7 +740,7 @@ class TileManager:
             print("Aligning tile phases...")
 
         # Merge results with phase alignment
-        result = self._merge_tiles_numpy(processed_tiles_np, (H, W), verbose=verbose)
+        result = self._merge_tiles_numpy(processed_tiles_np, (H, W), verbose=verbose, alignment_stride=alignment_stride)
 
         if verbose and not HAS_TQDM:
             print("  Done.")
@@ -746,6 +751,7 @@ class TileManager:
         self,
         tiles_data: list[tuple[TileInfo, np.ndarray]],
         verbose: bool = False,
+        alignment_stride: int | None = None,
     ) -> list[tuple[TileInfo, np.ndarray]]:
         """
         Align phase offsets between adjacent tiles (numpy/CPU version).
@@ -822,7 +828,10 @@ class TileManager:
 
                 # Subsample for speed on large overlaps
                 n_pixels = (r1 - r0) * (c1 - c0)
-                stride = max(1, int(np.sqrt(n_pixels / 100000))) if n_pixels > 100000 else 1
+                if alignment_stride is not None:
+                    stride = max(1, alignment_stride)
+                else:
+                    stride = max(1, int(np.sqrt(n_pixels / 30000))) if n_pixels > 30000 else 1
 
                 curr_overlap = curr_data[
                     r0 - curr_tile.row_start:r1 - curr_tile.row_start:stride,
@@ -956,6 +965,7 @@ class TileManager:
         tiles_data: list[tuple[TileInfo, np.ndarray]],
         shape: tuple[int, int],
         verbose: bool = False,
+        alignment_stride: int | None = None,
     ) -> np.ndarray:
         """
         Merge processed tiles back into a full image (numpy/CPU version).
@@ -970,7 +980,7 @@ class TileManager:
         if len(tiles_data) > 1:
             if verbose:
                 print("Aligning tile phases...")
-            tiles_data = self._align_tile_phases_numpy(tiles_data, verbose=verbose)
+            tiles_data = self._align_tile_phases_numpy(tiles_data, verbose=verbose, alignment_stride=alignment_stride)
 
         # Cosine-feathered blending: each tile contributes its full extent
         # with weights that ramp down in overlap regions.
