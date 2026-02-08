@@ -17,7 +17,7 @@ from rapidphase.api import (
 from rapidphase.device.manager import DeviceManager
 from rapidphase.filtering.goldstein import GoldsteinFilter
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 __all__ = [
     "unwrap",
     "unwrap_dct",
