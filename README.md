@@ -12,11 +12,11 @@ RapidPhase provides fast phase unwrapping algorithms optimized for GPU execution
 ## Features
 
 - **GPU Acceleration**: Automatic device selection (CUDA > MPS > CPU)
+- **Multi-GPU Support**: Parallel tile processing across multiple NVIDIA GPUs
 - **Multiple Algorithms**:
   - **DCT**: Fast unweighted least-squares using Discrete Cosine Transform
-  - **IRLS**: Iteratively Reweighted Least Squares with coherence weighting
-  - **IRLS-CG**: Conjugate Gradient solver with L1-norm approximation
-- **Tiled Processing**: Handle large interferograms with automatic tile merging
+  - **IRLS-CG**: DCT-preconditioned Conjugate Gradient with L1-norm approximation and coherence weighting
+- **Tiled Processing**: Handle arbitrarily large interferograms (tested on NISAR 66816 x 34128) with automatic tile size scaling, phase-consistent alignment via maximum spanning tree, and cosine-feathered blending
 - **Goldstein Filter**: Adaptive frequency-domain filter for noise reduction before unwrapping
 - **snaphu-py Compatible**: Drop-in replacement API for easy migration
 
@@ -88,19 +88,23 @@ print(rapidphase.get_available_devices())
 
 ## API Reference
 
-### Main Function
+### Phase Unwrapping
 
 ```python
 unw, conncomp = rapidphase.unwrap(
-    igram,              # Complex interferogram or wrapped phase
-    corr=None,          # Coherence map (optional), values in [0, 1]
-    nlooks=1.0,         # Number of looks for weight conversion
-    algorithm="auto",   # "dct", "irls", "irls_cg", or "auto"
-    device="auto",      # "cuda", "mps", "cpu", or "auto"
-    ntiles=None,        # Tile grid for large images, e.g., (4, 4)
-    tile_overlap=64,    # Overlap in pixels between tiles
+    igram,                    # Complex interferogram or wrapped phase
+    corr=None,                # Coherence map (optional), values in [0, 1]
+    nlooks=1.0,               # Number of looks for weight conversion
+    algorithm="auto",         # "dct", "irls_cg", or "auto"
+    device="auto",            # "cuda", "mps", "cpu", or "auto"
+    ntiles=None,              # Tile grid, e.g., (4, 4). Auto-scaled for large images
+    tile_overlap=None,        # Overlap in pixels (default: 10% of tile size)
+    n_gpus=None,              # Number of GPUs (default: all available)
+    verbose=False,            # Print tile alignment details
 )
 ```
+
+When `ntiles` is specified, tiles are automatically enlarged if they exceed ~80M pixels per tile to ensure solver reliability. Tile overlaps are aligned using a maximum spanning tree that prioritizes high-confidence paths, then blended with cosine-feathered weights.
 
 ### Convenience Functions
 
@@ -108,10 +112,7 @@ unw, conncomp = rapidphase.unwrap(
 # Fast DCT (no coherence weighting)
 unw, conncomp = rapidphase.unwrap_dct(igram)
 
-# IRLS with Jacobi solver (coherence-weighted)
-unw, conncomp = rapidphase.unwrap_irls(igram, corr, nlooks=5.0)
-
-# IRLS with Conjugate Gradient (L1 approximation, robust to outliers)
+# IRLS-CG (coherence-weighted, L1 approximation, robust to outliers)
 unw, conncomp = rapidphase.unwrap_irls_cg(igram, corr, nlooks=5.0)
 ```
 
@@ -125,16 +126,7 @@ igram_filtered = rapidphase.goldstein_filter(
     window_size=64,     # FFT window size in pixels
     overlap=0.75,       # Window overlap fraction
     device="auto",      # "cuda", "mps", "cpu", or "auto"
-)
-
-# For large images, use ntiles and patch_batch_size to manage memory
-igram_filtered = rapidphase.goldstein_filter(
-    igram_large,
-    alpha=0.5,
-    window_size=64,   
-    ntiles=(12, 12),          # Split into tiles for processing
-    patch_batch_size=128,   # Number of patches per batch (reduce if OOM)
-    device="cuda",
+    ntiles="auto",      # Tile grid (auto-scaled for large images)
 )
 
 # Then unwrap the filtered interferogram
@@ -143,36 +135,40 @@ unw, conncomp = rapidphase.unwrap(igram_filtered, corr, nlooks=5.0)
 
 ### Tiled Processing for Large Images
 
+For very large interferograms (e.g., NISAR at 66816 x 34128 pixels), tiled processing keeps GPU memory usage manageable:
+
 ```python
-# Process a large interferogram using 4x4 tiles
 unw, conncomp = rapidphase.unwrap(
     igram_large,
     corr_large,
     nlooks=10.0,
-    ntiles=(4, 4),
-    tile_overlap=128,
+    ntiles=(4, 4),          # Auto-scaled if tiles are too large
+    n_gpus=4,               # Use 4 GPUs in parallel
+    verbose=True,           # Monitor tile alignment progress
 )
+```
+
+### GPU Memory Management
+
+When combining RapidPhase with other GPU frameworks (e.g., CuPy), clear caches between frameworks:
+
+```python
+rapidphase.clear_gpu_cache()
 ```
 
 ### When to Use Each Algorithm
 
 - **DCT**: Best for clean data with high coherence. Fastest option.
-- **IRLS**: Good balance of speed and quality. Uses coherence for adaptive weighting.
-- **IRLS-CG**: Better for noisy data with outliers. Approximates L1-norm for robustness.
-- **SNAPHU**: Use when you need to handle phase discontinuities (e.g., fault lines).
+- **IRLS-CG**: Better for noisy data with low coherence. Uses coherence weighting and approximates L1-norm for robustness to outliers.
 
 ## Examples
 
-See the [examples/phase_unwrapping_examples.ipynb](examples/phase_unwrapping_examples.ipynb) notebook for:
+See the [examples/](examples/) directory for Jupyter notebooks demonstrating:
 
-1. Basic phase unwrapping
-2. Tiled processing for large images
-3. DCT vs IRLS algorithm comparison
-4. Complex interferogram patterns
-5. Noisy data handling
-6. Goldstein adaptive filtering for noise reduction
-7. Comparison with SNAPHU
-8. NISAR interferogram processing
+- Phase unwrapping with DCT and IRLS-CG algorithms
+- Tiled processing for large images
+- Goldstein adaptive filtering
+- NISAR and OPERA CSLC interferogram processing
 
 ## Performance
 
@@ -191,14 +187,13 @@ RapidPhase achieves significant speedups over CPU-based SNAPHU:
 ```
 rapidphase/
 ├── src/rapidphase/
-│   ├── __init__.py       # Package exports
-│   ├── api.py            # Public API
+│   ├── api.py            # Public API (unwrap, goldstein_filter)
 │   ├── core/             # Unwrapping algorithms
-│   │   ├── dct_solver.py
-│   │   ├── irls_solver.py
-│   │   └── irls_cg_solver.py
+│   │   ├── dct_solver.py       # DCT least-squares solver
+│   │   └── irls_cg_solver.py   # IRLS with DCT-preconditioned CG
 │   ├── device/           # GPU/CPU device management
-│   ├── tiling/           # Tile processing for large images
+│   ├── filtering/        # Goldstein adaptive filter
+│   ├── tiling/           # Tile processing, alignment, blending
 │   ├── utils/            # Phase operations, quality metrics
 │   └── io/               # Raster I/O (optional)
 ├── tests/                # Unit tests
