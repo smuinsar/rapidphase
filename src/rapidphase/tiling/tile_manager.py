@@ -567,8 +567,8 @@ class TileManager:
         # Store processed tiles as numpy arrays (CPU memory)
         processed_tiles_np: list[tuple[TileInfo, np.ndarray]] = []
 
-        # Set up progress iteration
-        if verbose and HAS_TQDM:
+        # Set up progress iteration (always show tqdm if available)
+        if HAS_TQDM:
             tile_iter = tqdm(
                 enumerate(tiles),
                 total=n_tiles,
@@ -663,9 +663,9 @@ class TileManager:
         progress_lock = threading.Lock()
         completed_count = [0]  # Use list to allow modification in nested function
 
-        # Progress bar for tqdm
+        # Progress bar (always show tqdm if available)
         pbar = None
-        if verbose and HAS_TQDM:
+        if HAS_TQDM:
             pbar = tqdm(
                 total=n_tiles,
                 desc=f"Unwrapping ({self.ntiles[0]}x{self.ntiles[1]} tiles, {n_gpus} GPUs)",
