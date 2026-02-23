@@ -9,6 +9,8 @@
 
 RapidPhase provides fast phase unwrapping algorithms optimized for GPU execution (NVIDIA CUDA and Apple Silicon MPS), with automatic CPU fallback. It offers a simple API compatible with [snaphu-py](https://github.com/isce-framework/snaphu-py) while delivering significant speedups on GPU hardware.
 
+> **Note**: This package is currently under active development and not yet fully mature. While it has been improved to support robust phase unwrapping, users may encounter limitations or breaking changes in future releases.
+
 ## Features
 
 - **GPU Acceleration**: Automatic device selection (CUDA > MPS > CPU)
